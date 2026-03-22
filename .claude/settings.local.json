@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv .venv)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(pip install:*)",
+      "mcp__7019e983-b3d4-4ba0-929f-b710928ec639__notion-create-database",
+      "mcp__7019e983-b3d4-4ba0-929f-b710928ec639__notion-update-data-source",
+      "Bash(python3 -:*)",
+      "Bash(python3 -c \"import bot; print\\(''bot.py OK''\\)\")",
+      "Bash(python3 -c \"from vision import analyze_food_text; print\\(''vision.py OK''\\)\")",
+      "Bash(python3 -c \"import bot; import vision; print\\(''OK''\\)\")",
+      "Bash(python3 -c \"import bot; print\\(''OK''\\)\")",
+      "Bash(python migrate_notion.py)",
+      "Bash(python3 -c \"import bot, vision, notion_helper, config; print\\(''All OK''\\)\")",
+      "Bash(python3 -c \":*)",
+      "Bash(timeout 8 python bot.py)"
+    ]
+  }
+}

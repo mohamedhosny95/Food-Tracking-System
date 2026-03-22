@@ -1,0 +1,1547 @@
+import csv
+import io
+import logging
+import logging.handlers
+import os
+import sys
+from datetime import date, datetime, timedelta, timezone
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    filters,
+    ContextTypes,
+)
+
+import config
+from vision import (
+    analyze_food_photo,
+    analyze_food_text,
+    analyze_restaurant_meal,
+    analyze_voice_message,
+    extract_barcode_number,
+    lookup_barcode_product,
+    NutritionData,
+)
+from notion_helper import (
+    get_or_create_daily_log,
+    create_food_entry,
+    get_today_totals,
+    get_saved_meals,
+    save_to_saved_meals,
+    log_water,
+    log_weight,
+    get_recent_weights,
+    search_restaurants,
+    add_restaurant,
+    get_last_week_data,
+    create_weekly_review_page,
+    get_yesterday_meals,
+    get_food_entries_range,
+)
+
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+def setup_logging() -> None:
+    os.makedirs("logs", exist_ok=True)
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [
+        logging.StreamHandler(sys.stdout),
+        logging.handlers.RotatingFileHandler(
+            "logs/app.log", maxBytes=5_000_000, backupCount=3
+        ),
+    ]
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+
+def is_authorized(user_id: int) -> bool:
+    if not config.ALLOWED_USER_IDS:
+        return True
+    return user_id in config.ALLOWED_USER_IDS
+
+
+# ── Conversation states ────────────────────────────────────────────────────────
+
+(
+    WAITING_FOR_TEXT,
+    WAITING_FOR_RESTAURANT,
+    WAITING_FOR_BARCODE,
+    CONFIRMING_ANALYSIS,
+    CORRECTING_NAME,
+    ADJUSTING_PORTION,
+    CHOOSING_PORTION_SIZE,       # photo: Small/Medium/Large/Custom after AI analysis
+    ENTERING_CUSTOM_WEIGHT,      # photo: user typing gram weight for custom portion
+    CHOOSING_COOKING_CONTEXT,    # ingredients: cooking method / raw vs cooked
+    CHOOSING_SERVING_TYPE,       # restaurant: home-cooked vs restaurant portion
+    WAITING_FOR_WATER,           # water: user types quantity in ml
+    WAITING_FOR_WEIGHT_INPUT,    # weight: user types body weight in kg
+) = range(12)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def get_meal_type() -> str:
+    h = datetime.now().hour
+    if 5 <= h < 11:   return "Breakfast"
+    if 11 <= h < 15:  return "Lunch"
+    if 15 <= h < 18:  return "Snack"
+    if 18 <= h < 22:  return "Dinner"
+    return "Snack"
+
+
+def _progress_bar(current: float, goal: float, width: int = 10) -> str:
+    if goal <= 0:
+        return "░" * width
+    filled = round(min(current / goal, 1.0) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _confidence_label(nutrition: NutritionData) -> str:
+    pct = nutrition.confidence_pct
+    return f"~{pct}% confident" if pct else nutrition.confidence
+
+
+def _build_summary(nutrition: NutritionData, page_url: str = "", meal_type: str = "") -> str:
+    icon = {"High": "✓", "Medium": "~", "Low": "?"}.get(nutrition.confidence, "")
+    tag = f"[{meal_type}] " if meal_type else ""
+    lines = [
+        f"Logged: {tag}{nutrition.food_name} {icon}",
+        f"Portion: {nutrition.portion_size}",
+        "",
+        f"Calories:  {nutrition.calories:.0f} kcal",
+        f"Protein:   {nutrition.protein_g:.1f} g",
+        f"Carbs:     {nutrition.carbs_g:.1f} g",
+        f"Fat:       {nutrition.fat_g:.1f} g",
+        f"Fiber:     {nutrition.fiber_g:.1f} g",
+        f"Sugar:     {nutrition.sugar_g:.1f} g",
+        f"Sodium:    {nutrition.sodium_mg:.0f} mg",
+    ]
+    if nutrition.notes:
+        lines += ["", f"Notes: {nutrition.notes}"]
+    if page_url:
+        lines += ["", f"Notion: {page_url}"]
+    return "\n".join(lines)
+
+
+def _is_fasting(bot_data: dict) -> bool:
+    return date.today().isoformat() in bot_data.get("fasting_days", set())
+
+
+def _build_daily_summary(totals: dict, fasting: bool = False) -> str:
+    def row(label: str, val: float, goal: int, unit: str) -> str:
+        bar = _progress_bar(val, goal)
+        pct = min(int(val / goal * 100), 100) if goal > 0 else 0
+        rem = max(goal - val, 0)
+        return f"{label}\n{bar} {val:.0f}/{goal}{unit} ({pct}%) — {rem:.0f}{unit} left"
+
+    cal = totals.get("calories", 0)
+    header = "Today's Progress  🌙 Fasting Day" if fasting else "Today's Progress"
+
+    # Incomplete day warning: after 8pm local, if <60% of calorie goal and not fasting
+    local_hour = (datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_HOURS)).hour
+    warning = ""
+    if not fasting and local_hour >= 20 and cal < config.DAILY_CALORIES_GOAL * 0.6:
+        shortfall = int(config.DAILY_CALORIES_GOAL - cal)
+        warning = f"\n\nYou're {shortfall} kcal below your goal — did you forget to log something?"
+
+    lines = [header]
+    if not fasting:
+        lines += [
+            "",
+            row("Calories", cal,                          config.DAILY_CALORIES_GOAL, " kcal"),
+            row("Protein ", totals.get("protein_g", 0),   config.DAILY_PROTEIN_GOAL,  "g"),
+            row("Carbs   ", totals.get("carbs_g", 0),     config.DAILY_CARBS_GOAL,    "g"),
+            row("Fat     ", totals.get("fat_g", 0),       config.DAILY_FAT_GOAL,      "g"),
+            row("Fiber   ", totals.get("fiber_g", 0),     config.DAILY_FIBER_GOAL,    "g"),
+            "",
+            f"Sugar:  {totals.get('sugar_g', 0):.0f}g    Sodium: {totals.get('sodium_mg', 0):.0f}mg",
+        ]
+    lines += ["", row("Water", totals.get("water_ml", 0), config.DAILY_WATER_GOAL_ML, " ml")]
+
+    if totals.get("weight_kg"):
+        lines += [f"\nWeight: {totals['weight_kg']:.1f} kg"]
+
+    return "\n".join(lines) + warning
+
+
+def _save_meal_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⭐ Save as frequent meal", callback_data="save_meal")
+    ]])
+
+
+async def _log_and_show(
+    msg,
+    nutrition: NutritionData,
+    photo_url: str = "",
+    meal_type: str = "",
+    log_method: str = "",
+    context: ContextTypes.DEFAULT_TYPE = None,
+) -> None:
+    """Save to Notion and edit msg with summary + optional save button."""
+    await msg.edit_text("Logging to Notion...")
+    today = date.today()
+    daily_log_id = await get_or_create_daily_log(today)
+    page_url = await create_food_entry(
+        nutrition, photo_url, daily_log_id, today,
+        meal_type=meal_type, log_method=log_method,
+    )
+    summary = _build_summary(nutrition, page_url, meal_type)
+
+    # Store for potential "save as frequent meal" tap
+    if context is not None:
+        context.user_data["last_nutrition"] = nutrition
+        context.user_data["last_meal_type"] = meal_type
+
+    show_save = bool(config.NOTION_SAVED_MEALS_DB_ID)
+    await msg.edit_text(
+        summary,
+        reply_markup=_save_meal_keyboard() if show_save else None,
+    )
+
+
+# ── /start ─────────────────────────────────────────────────────────────────────
+
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.bot_data["chat_id"] = update.effective_chat.id
+    await update.message.reply_text(
+        "Food Tracker ready.\n\n"
+        "Send a photo or voice message to log a meal, or use /log.\n\n"
+        "/summary  — today's macro progress\n"
+        "/recent   — re-log a saved meal\n"
+        "/yesterday — copy yesterday's meals\n"
+        "/weight   — log your body weight (e.g. /weight 85)\n"
+        "/fasting  — toggle fasting mode for today\n"
+        "/export   — export your food log as CSV"
+    )
+
+
+# ── /log conversation ──────────────────────────────────────────────────────────
+
+async def log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📷  Send a Photo",          callback_data="log_photo")],
+        [InlineKeyboardButton("🍽️  Restaurant / Meal Name", callback_data="log_restaurant")],
+        [InlineKeyboardButton("✏️  Type Ingredients",       callback_data="log_text")],
+        [InlineKeyboardButton("📊  Scan Barcode",           callback_data="log_barcode")],
+        [InlineKeyboardButton("💧  Log Water",              callback_data="log_water")],
+        [InlineKeyboardButton("⚖️  Log Weight",             callback_data="log_weight_menu")],
+    ])
+    await update.message.reply_text(
+        "What do you want to log?", reply_markup=keyboard
+    )
+    return WAITING_FOR_TEXT
+
+
+async def choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "log_photo":
+        await query.edit_message_text("Send me your food photo.")
+        return ConversationHandler.END
+
+    if query.data == "log_restaurant":
+        await query.edit_message_text(
+            "What are you eating?\n\n"
+            "Include the restaurant name if you know it — e.g.:\n"
+            "• Big Mac + large fries at McDonald's\n"
+            "• Chicken Caesar salad at Chili's\n"
+            "• Margherita pizza (local Italian place)"
+        )
+        return WAITING_FOR_RESTAURANT
+
+    if query.data == "log_barcode":
+        await query.edit_message_text(
+            "Send a photo of the barcode on the product packaging.\n"
+            "Make sure it is clearly visible and in focus."
+        )
+        return WAITING_FOR_BARCODE
+
+    if query.data == "log_water":
+        await query.edit_message_text(
+            "How much water did you drink?\n\nType the amount in ml — e.g. 500"
+        )
+        return WAITING_FOR_WATER
+
+    if query.data == "log_weight_menu":
+        history = await get_recent_weights(4)
+        if history:
+            lines = ["Recent weigh-ins:"]
+            for entry in history:
+                lines.append(f"  {entry['date']}  →  {entry['weight_kg']:.1f} kg")
+            lines += ["", "Enter your current weight in kg:"]
+            prompt = "\n".join(lines)
+        else:
+            prompt = "Enter your current weight in kg — e.g. 85 or 85.5"
+        await query.edit_message_text(prompt)
+        return WAITING_FOR_WEIGHT_INPUT
+
+    # log_text
+    await query.edit_message_text(
+        "Describe your meal or list the ingredients.\n\n"
+        "Be as specific as possible — include quantities, e.g.:\n"
+        "\"ice coffee with 200ml whole milk, 2 shots espresso, 1 tsp honey\""
+    )
+    return WAITING_FOR_TEXT
+
+
+# ── Photo entry: analyze → confirm ────────────────────────────────────────────
+
+async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger = logging.getLogger(__name__)
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    status = await update.message.reply_text("Analyzing your meal...")
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+        photo_url: str = tg_file.file_path
+        if not photo_url.startswith("http"):
+            photo_url = (
+                f"https://api.telegram.org/file/bot{config.TELEGRAM_BOT_TOKEN}"
+                f"/{tg_file.file_path}"
+            )
+        image_bytes = bytes(await tg_file.download_as_bytearray())
+
+        await status.edit_text("Identifying food and calculating nutrition...")
+        nutrition = await analyze_food_photo(image_bytes)
+
+        if not nutrition.recognizable:
+            await status.edit_text(
+                "Could not identify the food in this photo.\n\n"
+                f"Notes: {nutrition.notes}\n\n"
+                "Try a clearer photo or a different angle."
+            )
+            return ConversationHandler.END
+
+        # Store pending data and show confirmation
+        context.user_data["pending_nutrition"] = nutrition
+        context.user_data["pending_photo_url"] = photo_url
+        context.user_data["pending_meal_type"] = get_meal_type()
+        context.user_data["pending_log_method"] = "Photo"
+
+        await status.edit_text(
+            _portion_size_question(nutrition),
+            reply_markup=_portion_size_keyboard(),
+        )
+        return CHOOSING_PORTION_SIZE
+
+    except RuntimeError as e:
+        logger.error("RuntimeError in photo_entry: %s", e)
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+    except Exception:
+        logger.exception("Unexpected error in photo_entry")
+        await status.edit_text("An unexpected error occurred. Please try again.")
+    return ConversationHandler.END
+
+
+async def photo_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "photo_cancel":
+        await query.edit_message_text("Cancelled. Nothing was saved.")
+        return ConversationHandler.END
+
+    if query.data == "photo_correct":
+        await query.edit_message_text(
+            "What is the correct name for this dish?\n\nType it and I'll save with your correction."
+        )
+        return CORRECTING_NAME
+
+    if query.data == "photo_portion":
+        nutrition = context.user_data.get("pending_nutrition")
+        if not nutrition:
+            await query.edit_message_text("Session expired. Please send the photo again.")
+            return ConversationHandler.END
+        await query.edit_message_text(
+            f"How much of this did you eat?\n\n"
+            f"Full portion = {nutrition.calories:.0f} kcal\n\n"
+            f"Enter a number from 1 to 100 (e.g. 50 = half, 75 = three quarters):"
+        )
+        return ADJUSTING_PORTION
+
+    # photo_confirm
+    nutrition = context.user_data.get("pending_nutrition")
+    photo_url = context.user_data.get("pending_photo_url", "")
+    meal_type = context.user_data.get("pending_meal_type", get_meal_type())
+    log_method = context.user_data.get("pending_log_method", "Photo")
+
+    if not nutrition:
+        await query.edit_message_text("Session expired. Please send the photo again.")
+        return ConversationHandler.END
+
+    try:
+        await _log_and_show(
+            query.message, nutrition,
+            photo_url=photo_url, meal_type=meal_type, log_method=log_method,
+            context=context,
+        )
+        if context.user_data.get("show_add_restaurant") and config.NOTION_RESTAURANTS_DB_ID:
+            await query.message.reply_text(
+                "Restaurant not in your favorites.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("➕ Add to favorites", callback_data="add_restaurant")
+                ]]),
+            )
+            context.user_data.pop("show_add_restaurant", None)
+    except Exception:
+        logger.exception("Error saving confirmed entry")
+        await query.edit_message_text("Something went wrong saving. Please try again.")
+    return ConversationHandler.END
+
+
+async def photo_correction_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    nutrition: NutritionData = context.user_data.get("pending_nutrition")
+    if not nutrition:
+        await update.message.reply_text("Session expired. Please send the photo again.")
+        return ConversationHandler.END
+
+    nutrition.food_name = update.message.text.strip()[:100]
+    photo_url = context.user_data.get("pending_photo_url", "")
+    meal_type = context.user_data.get("pending_meal_type", get_meal_type())
+    log_method = context.user_data.get("pending_log_method", "Photo")
+
+    status = await update.message.reply_text("Saving with your correction...")
+    try:
+        await _log_and_show(
+            status, nutrition,
+            photo_url=photo_url, meal_type=meal_type, log_method=log_method,
+            context=context,
+        )
+    except Exception:
+        logger.exception("Error saving corrected photo entry")
+        await status.edit_text("Something went wrong saving. Please try again.")
+    return ConversationHandler.END
+
+
+async def portion_percentage_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    nutrition: NutritionData = context.user_data.get("pending_nutrition")
+    if not nutrition:
+        await update.message.reply_text("Session expired. Please send the photo again.")
+        return ConversationHandler.END
+
+    raw = update.message.text.strip().replace("%", "")
+    try:
+        pct = float(raw)
+    except ValueError:
+        await update.message.reply_text(
+            "Please enter a number between 1 and 100 (e.g. 50 for half the portion)."
+        )
+        return ADJUSTING_PORTION
+
+    if not (1 <= pct <= 100):
+        await update.message.reply_text(
+            "Please enter a number between 1 and 100."
+        )
+        return ADJUSTING_PORTION
+
+    factor = pct / 100.0
+    _scale_nutrition(nutrition, factor)
+    nutrition.portion_size = f"{int(pct)}% of {nutrition.portion_size}"
+    nutrition.notes = f"Ate {int(pct)}% of full portion. " + nutrition.notes
+
+    photo_url = context.user_data.get("pending_photo_url", "")
+    meal_type = context.user_data.get("pending_meal_type", get_meal_type())
+    log_method = context.user_data.get("pending_log_method", "Photo")
+
+    status = await update.message.reply_text(f"Saving {int(pct)}% of the portion...")
+    try:
+        await _log_and_show(
+            status, nutrition,
+            photo_url=photo_url, meal_type=meal_type, log_method=log_method,
+            context=context,
+        )
+    except Exception:
+        logger.exception("Error saving portion-adjusted entry")
+        await status.edit_text("Something went wrong saving. Please try again.")
+    return ConversationHandler.END
+
+
+# ── Voice entry: transcribe → confirm ─────────────────────────────────────────
+
+async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger = logging.getLogger(__name__)
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    status = await update.message.reply_text("Listening to your voice note...")
+    try:
+        voice = update.message.voice
+        tg_file = await context.bot.get_file(voice.file_id)
+        audio_bytes = bytes(await tg_file.download_as_bytearray())
+
+        await status.edit_text("Analyzing what you described...")
+        nutrition = await analyze_voice_message(audio_bytes)
+
+        if not nutrition.recognizable:
+            await status.edit_text(
+                "Could not identify any food in your voice note.\n\n"
+                f"Notes: {nutrition.notes}\n\n"
+                "Try describing the food more clearly."
+            )
+            return ConversationHandler.END
+
+        context.user_data["pending_nutrition"] = nutrition
+        context.user_data["pending_photo_url"] = ""
+        context.user_data["pending_meal_type"] = get_meal_type()
+        context.user_data["pending_log_method"] = "Voice"
+
+        transcript_line = (
+            f"I heard: \"{nutrition.transcription}\"\n\n"
+            if nutrition.transcription else ""
+        )
+        await status.edit_text(
+            transcript_line + _portion_size_question(nutrition),
+            reply_markup=_portion_size_keyboard(),
+        )
+        return CHOOSING_PORTION_SIZE
+
+    except RuntimeError as e:
+        logger.error("RuntimeError in voice_entry: %s", e)
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+    except Exception:
+        logger.exception("Unexpected error in voice_entry")
+        await status.edit_text("An unexpected error occurred. Please try again.")
+    return ConversationHandler.END
+
+
+# ── Restaurant handler ─────────────────────────────────────────────────────────
+
+def _confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Looks right", callback_data="photo_confirm"),
+            InlineKeyboardButton("✏️ Fix name",    callback_data="photo_correct"),
+        ],
+        [
+            InlineKeyboardButton("🍽️ I ate X%",   callback_data="photo_portion"),
+            InlineKeyboardButton("❌ Cancel",       callback_data="photo_cancel"),
+        ],
+    ])
+
+
+def _confirmation_preview(nutrition: "NutritionData", label: str = "") -> str:
+    conf = _confidence_label(nutrition)
+    header = f"I think this is {nutrition.food_name} ({conf})" if not label else label
+    return (
+        f"{header}\n\n"
+        f"Calories:  {nutrition.calories:.0f} kcal\n"
+        f"Protein:   {nutrition.protein_g:.1f} g\n"
+        f"Carbs:     {nutrition.carbs_g:.1f} g\n"
+        f"Fat:       {nutrition.fat_g:.1f} g"
+    )
+
+
+async def restaurant_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    description = update.message.text.strip()
+    context.user_data["pending_restaurant_text"] = description
+    context.user_data["pending_meal_type"] = get_meal_type()
+    context.user_data["pending_log_method"] = "Restaurant"
+
+    await update.message.reply_text(
+        f"Got it — \"{description}\"\n\nOne quick question:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Home-cooked portion",      callback_data="serve_home"),
+            InlineKeyboardButton("🍽️ Restaurant-sized portion", callback_data="serve_restaurant"),
+        ]]),
+    )
+    return CHOOSING_SERVING_TYPE
+
+
+# ── Ingredients handler ────────────────────────────────────────────────────────
+
+async def ingredients_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    context.user_data["pending_ingredients_text"] = update.message.text.strip()
+    context.user_data["pending_meal_type"] = get_meal_type()
+    context.user_data["pending_log_method"] = "Ingredients"
+
+    await update.message.reply_text(
+        "Got it! Quick context before I calculate — how was this prepared?\n\n"
+        "This helps me get the fat and calorie count right.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🥩 Raw weight",     callback_data="cook_raw"),
+                InlineKeyboardButton("🍳 Cooked weight",  callback_data="cook_cooked"),
+            ],
+            [
+                InlineKeyboardButton("🔥 Grilled",        callback_data="cook_grilled"),
+                InlineKeyboardButton("🍳 Fried",          callback_data="cook_fried"),
+                InlineKeyboardButton("💧 Boiled/Steamed", callback_data="cook_boiled"),
+            ],
+            [
+                InlineKeyboardButton("⏭️ Skip",           callback_data="cook_skip"),
+            ],
+        ]),
+    )
+    return CHOOSING_COOKING_CONTEXT
+
+
+# ── Serving type callback (restaurant: home vs restaurant portion) ─────────────
+
+async def serving_type_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    query = update.callback_query
+    await query.answer()
+
+    serving_type = "restaurant" if query.data == "serve_restaurant" else "home"
+    description = context.user_data.get("pending_restaurant_text", "")
+    meal_type = context.user_data.get("pending_meal_type", get_meal_type())
+
+    label = "🍽️ Restaurant-sized" if serving_type == "restaurant" else "🏠 Home-cooked"
+    await query.edit_message_text(f"{label} — looking up nutrition...")
+
+    try:
+        nutrition = await analyze_restaurant_meal(description, serving_type=serving_type)
+
+        if not nutrition.recognizable:
+            await query.edit_message_text(
+                "Could not find nutrition info for that meal.\n\n"
+                f"Notes: {nutrition.notes}\n\n"
+                "Try adding more detail, e.g. the restaurant name or dish name."
+            )
+            return ConversationHandler.END
+
+        if nutrition.confidence != "High":
+            context.user_data["last_restaurant_name"] = description
+            context.user_data["show_add_restaurant"] = True
+
+        context.user_data["pending_nutrition"] = nutrition
+        context.user_data["pending_photo_url"] = ""
+
+        await query.edit_message_text(
+            _portion_size_question(nutrition),
+            reply_markup=_portion_size_keyboard(),
+        )
+        return CHOOSING_PORTION_SIZE
+
+    except RuntimeError as e:
+        logger.error("RuntimeError in serving_type_callback: %s", e)
+        await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
+    except Exception:
+        logger.exception("Unexpected error in serving_type_callback")
+        await query.edit_message_text("An unexpected error occurred. Please try again.")
+    return ConversationHandler.END
+
+
+# ── Cooking context callback (ingredients: raw/cooked/method) ──────────────────
+
+async def cooking_context_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    query = update.callback_query
+    await query.answer()
+
+    cooking_map = {
+        "cook_raw":    "raw weight (not yet cooked)",
+        "cook_cooked": "cooked/measured weight",
+        "cook_grilled":"grilled",
+        "cook_fried":  "fried",
+        "cook_boiled": "boiled or steamed",
+        "cook_skip":   "",
+    }
+    cooking_context = cooking_map.get(query.data, "")
+    description = context.user_data.get("pending_ingredients_text", "")
+    meal_type = context.user_data.get("pending_meal_type", get_meal_type())
+
+    label = f"({cooking_context})" if cooking_context else "(no cooking context)"
+    await query.edit_message_text(f"Calculating nutrition {label}...")
+
+    try:
+        nutrition = await analyze_food_text(description, cooking_context=cooking_context)
+
+        if not nutrition.recognizable:
+            await query.edit_message_text(
+                "Could not estimate nutrition from that description.\n\n"
+                f"Notes: {nutrition.notes}\n\n"
+                "Try adding more detail, e.g. quantities and ingredients."
+            )
+            return ConversationHandler.END
+
+        context.user_data["pending_nutrition"] = nutrition
+        context.user_data["pending_photo_url"] = ""
+
+        await query.edit_message_text(
+            _portion_size_question(nutrition),
+            reply_markup=_portion_size_keyboard(),
+        )
+        return CHOOSING_PORTION_SIZE
+
+    except RuntimeError as e:
+        logger.error("RuntimeError in cooking_context_callback: %s", e)
+        await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
+    except Exception:
+        logger.exception("Unexpected error in cooking_context_callback")
+        await query.edit_message_text("An unexpected error occurred. Please try again.")
+    return ConversationHandler.END
+
+
+# ── Portion size selector (photo/voice/restaurant/ingredients) ─────────────────
+
+def _portion_size_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🥣 Small (~60%)",   callback_data="psize_small"),
+            InlineKeyboardButton("🍽️ Looks right",    callback_data="psize_medium"),
+        ],
+        [
+            InlineKeyboardButton("🫕 Large (~140%)",  callback_data="psize_large"),
+            InlineKeyboardButton("⚖️ Custom weight",  callback_data="psize_custom"),
+        ],
+    ])
+
+
+def _portion_size_question(nutrition: "NutritionData") -> str:
+    weight_line = (
+        f"My estimate: ~{int(nutrition.estimated_weight_g)}g\n"
+        if nutrition.estimated_weight_g else ""
+    )
+    tip = "\nTip: Place a fork or hand next to food for a better size anchor next time." if not nutrition.estimated_weight_g else ""
+    return (
+        f"I identified: {nutrition.food_name}\n\n"
+        f"Calories: {nutrition.calories:.0f} kcal  |  Protein: {nutrition.protein_g:.1f}g  "
+        f"|  Carbs: {nutrition.carbs_g:.1f}g  |  Fat: {nutrition.fat_g:.1f}g\n\n"
+        f"{weight_line}"
+        f"📏 How does the portion size look?{tip}"
+    )
+
+
+async def portion_size_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    query = update.callback_query
+    await query.answer()
+
+    nutrition: NutritionData = context.user_data.get("pending_nutrition")
+    if not nutrition:
+        await query.edit_message_text("Session expired. Please start again.")
+        return ConversationHandler.END
+
+    if query.data == "psize_custom":
+        est = f" (I estimated ~{int(nutrition.estimated_weight_g)}g)" if nutrition.estimated_weight_g else ""
+        await query.edit_message_text(
+            f"Enter the actual weight in grams{est}:\n\nExample: 350"
+        )
+        return ENTERING_CUSTOM_WEIGHT
+
+    factor_map = {"psize_small": 0.6, "psize_medium": 1.0, "psize_large": 1.4}
+    factor = factor_map.get(query.data, 1.0)
+
+    if factor != 1.0:
+        label = {"psize_small": "Small (~60%)", "psize_large": "Large (~140%)"}[query.data]
+        _scale_nutrition(nutrition, factor)
+        nutrition.portion_size = f"{label} portion of {nutrition.portion_size}"
+        nutrition.notes = f"Portion adjusted: {label}. " + nutrition.notes
+
+    await query.edit_message_text(
+        _confirmation_preview(nutrition),
+        reply_markup=_confirmation_keyboard(),
+    )
+    return CONFIRMING_ANALYSIS
+
+
+async def custom_weight_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    nutrition: NutritionData = context.user_data.get("pending_nutrition")
+    if not nutrition:
+        await update.message.reply_text("Session expired. Please start again.")
+        return ConversationHandler.END
+
+    raw = update.message.text.strip().replace("g", "").replace("G", "").strip()
+    try:
+        user_weight = float(raw)
+    except ValueError:
+        await update.message.reply_text("Please enter a number in grams, e.g. 350")
+        return ENTERING_CUSTOM_WEIGHT
+
+    if not (10 <= user_weight <= 5000):
+        await update.message.reply_text("Please enter a weight between 10g and 5000g.")
+        return ENTERING_CUSTOM_WEIGHT
+
+    if nutrition.estimated_weight_g and nutrition.estimated_weight_g > 0:
+        factor = user_weight / nutrition.estimated_weight_g
+    else:
+        # No reference weight — treat user's input as a direct portion % of estimated macros
+        # Ask them to use the X% button instead
+        await update.message.reply_text(
+            "I don't have a weight reference for this item. "
+            "Please use 🍽️ I ate X% instead to adjust the portion."
+        )
+        await update.message.reply_text(
+            _confirmation_preview(nutrition),
+            reply_markup=_confirmation_keyboard(),
+        )
+        return CONFIRMING_ANALYSIS
+
+    _scale_nutrition(nutrition, factor)
+    nutrition.portion_size = f"{int(user_weight)}g (custom)"
+    nutrition.notes = f"User-entered weight: {int(user_weight)}g (AI estimated {int(nutrition.estimated_weight_g)}g). " + nutrition.notes
+    nutrition.estimated_weight_g = user_weight
+
+    await update.message.reply_text(
+        _confirmation_preview(nutrition),
+        reply_markup=_confirmation_keyboard(),
+    )
+    return CONFIRMING_ANALYSIS
+
+
+def _scale_nutrition(nutrition: "NutritionData", factor: float) -> None:
+    """Scale all macro fields in-place by factor."""
+    nutrition.calories  = round(nutrition.calories  * factor, 1)
+    nutrition.protein_g = round(nutrition.protein_g * factor, 1)
+    nutrition.carbs_g   = round(nutrition.carbs_g   * factor, 1)
+    nutrition.fat_g     = round(nutrition.fat_g     * factor, 1)
+    nutrition.fiber_g   = round(nutrition.fiber_g   * factor, 1)
+    nutrition.sugar_g   = round(nutrition.sugar_g   * factor, 1)
+    nutrition.sodium_mg = round(nutrition.sodium_mg * factor, 1)
+
+
+# ── Barcode handler ────────────────────────────────────────────────────────────
+
+async def barcode_photo_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    meal_type = get_meal_type()
+    status = await update.message.reply_text("Reading barcode...")
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+        image_bytes = bytes(await tg_file.download_as_bytearray())
+
+        barcode = await extract_barcode_number(image_bytes)
+        if not barcode:
+            await status.edit_text(
+                "Could not read a barcode from this photo.\n\n"
+                "Make sure the barcode is clear and well-lit, then try again."
+            )
+            return ConversationHandler.END
+
+        await status.edit_text(f"Barcode {barcode} found — looking up product...")
+        nutrition = await lookup_barcode_product(barcode)
+
+        if not nutrition:
+            await status.edit_text(
+                f"Barcode {barcode} not found in Open Food Facts.\n\n"
+                "Try logging via /log → Restaurant / Meal Name instead."
+            )
+            return ConversationHandler.END
+
+        context.user_data["pending_nutrition"] = nutrition
+        context.user_data["pending_photo_url"] = ""
+        context.user_data["pending_meal_type"] = meal_type
+        context.user_data["pending_log_method"] = "Barcode"
+
+        await status.edit_text(
+            _confirmation_preview(nutrition, label=f"Found: {nutrition.food_name}"),
+            reply_markup=_confirmation_keyboard(),
+        )
+        return CONFIRMING_ANALYSIS
+    except RuntimeError as e:
+        logger.error("RuntimeError in barcode_photo_handler: %s", e)
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+    except Exception:
+        logger.exception("Unexpected error in barcode_photo_handler")
+        await status.edit_text("An unexpected error occurred. Please try again.")
+    return ConversationHandler.END
+
+
+async def water_amount_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    raw = update.message.text.strip().lower().replace("ml", "").replace("l", "000").strip()
+    try:
+        amount = int(float(raw))
+    except ValueError:
+        await update.message.reply_text("Please type a number, e.g. 500")
+        return WAITING_FOR_WATER
+
+    if not (1 <= amount <= 5000):
+        await update.message.reply_text("Please enter an amount between 1 and 5000 ml.")
+        return WAITING_FOR_WATER
+
+    new_total = await log_water(amount, date.today())
+    bar = _progress_bar(new_total, config.DAILY_WATER_GOAL_ML)
+    pct = min(int(new_total / config.DAILY_WATER_GOAL_ML * 100), 100)
+    rem = max(config.DAILY_WATER_GOAL_ML - new_total, 0)
+    await update.message.reply_text(
+        f"💧 +{amount}ml logged\n\n"
+        f"{bar} {new_total}ml / {config.DAILY_WATER_GOAL_ML}ml ({pct}%)\n"
+        f"{rem}ml remaining today"
+    )
+    return ConversationHandler.END
+
+
+async def weight_input_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    raw = update.message.text.strip().lower().replace("kg", "").strip()
+    try:
+        weight = float(raw)
+    except ValueError:
+        await update.message.reply_text("Please enter a number, e.g. 85 or 85.5")
+        return WAITING_FOR_WEIGHT_INPUT
+
+    if not (30 <= weight <= 300):
+        await update.message.reply_text("Please enter a weight between 30 and 300 kg.")
+        return WAITING_FOR_WEIGHT_INPUT
+
+    await log_weight(weight, date.today())
+
+    # Fetch history to show trend
+    history = await get_recent_weights(5)
+    lines = [f"⚖️ Weight logged: {weight:.1f} kg"]
+
+    # Show change vs previous entry (skip if the first entry is today's — just logged)
+    prev_entries = [e for e in history if e["date"] != date.today().isoformat()]
+    if prev_entries:
+        prev = prev_entries[0]
+        delta = weight - prev["weight_kg"]
+        sign = "+" if delta >= 0 else ""
+        lines.append(f"Change since {prev['date']}: {sign}{delta:.1f} kg")
+
+    # Show last 4 weigh-ins as a mini chart
+    chart_entries = [e for e in history if e["date"] != date.today().isoformat()][:3]
+    if chart_entries:
+        lines.append("")
+        lines.append("Recent trend:")
+        for e in reversed(chart_entries):
+            lines.append(f"  {e['date']}  {e['weight_kg']:.1f} kg")
+        lines.append(f"  {date.today().isoformat()}  {weight:.1f} kg  ← today")
+
+    # Macro suggestions
+    suggested_cal = round(weight * 33)
+    suggested_protein = round(weight * 2.0)
+    diff_cal = suggested_cal - config.DAILY_CALORIES_GOAL
+    diff_prot = suggested_protein - config.DAILY_PROTEIN_GOAL
+    if abs(diff_cal) >= 50 or abs(diff_prot) >= 5:
+        sign_cal  = "+" if diff_cal  >= 0 else ""
+        sign_prot = "+" if diff_prot >= 0 else ""
+        lines += [
+            "",
+            "Suggested targets based on your weight:",
+            f"  Calories: {suggested_cal} kcal ({sign_cal}{diff_cal} vs current)",
+            f"  Protein:  {suggested_protein}g ({sign_prot}{diff_prot}g vs current)",
+        ]
+
+    await update.message.reply_text("\n".join(lines))
+    return ConversationHandler.END
+
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+# ── Save meal / Add restaurant callbacks ───────────────────────────────────────
+
+async def save_meal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    nutrition: NutritionData | None = context.user_data.get("last_nutrition")
+    meal_type: str = context.user_data.get("last_meal_type", "")
+
+    if not nutrition:
+        await query.answer("Session expired — nothing to save.", show_alert=True)
+        return
+
+    await save_to_saved_meals(nutrition, meal_type)
+    # Remove the save button after tapping
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"⭐ \"{nutrition.food_name}\" saved to frequent meals.")
+
+
+async def add_restaurant_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    name = context.user_data.get("last_restaurant_name", "")
+    if not name:
+        await query.answer("Restaurant name not found.", show_alert=True)
+        return
+
+    await add_restaurant(name)
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"➕ \"{name}\" added to your favorites.")
+
+
+# ── /summary ──────────────────────────────────────────────────────────────────
+
+async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Fetching today's totals...")
+    fasting = _is_fasting(context.bot_data)
+    totals = await get_today_totals(date.today())
+    if not totals and not fasting:
+        await msg.edit_text("No meals logged today yet. Use /log to add your first meal.")
+        return
+    await msg.edit_text(_build_daily_summary(totals or {}, fasting=fasting))
+
+
+# ── /water ────────────────────────────────────────────────────────────────────
+
+async def water_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /water 500\n\nAmount in ml — e.g. /water 250 or /water 1000"
+        )
+        return
+    try:
+        amount = int(context.args[0].lower().replace("ml", "").strip())
+    except ValueError:
+        await update.message.reply_text("Please specify a number, e.g. /water 500")
+        return
+    if not (1 <= amount <= 5000):
+        await update.message.reply_text("Please enter an amount between 1 and 5000 ml.")
+        return
+
+    new_total = await log_water(amount, date.today())
+    bar = _progress_bar(new_total, config.DAILY_WATER_GOAL_ML)
+    pct = min(int(new_total / config.DAILY_WATER_GOAL_ML * 100), 100)
+    rem = max(config.DAILY_WATER_GOAL_ML - new_total, 0)
+    await update.message.reply_text(
+        f"Logged {amount} ml of water.\n\n"
+        f"Water\n{bar} {new_total}/{config.DAILY_WATER_GOAL_ML} ml ({pct}%) — {rem} ml left"
+    )
+
+
+# ── /recent ───────────────────────────────────────────────────────────────────
+
+async def recent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Fetching saved meals...")
+    meals = await get_saved_meals()
+    if not meals:
+        await msg.edit_text("No saved meals yet. Log meals and tap ⭐ to save them.")
+        return
+
+    context.bot_data.setdefault("recent_meals", {}).update(
+        {m["page_id"]: m for m in meals}
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{m['name'][:26]} ({m['calories']:.0f} kcal)"
+            + (f" ×{m['times_logged']}" if m.get("times_logged") else ""),
+            callback_data=f"relog_{m['page_id']}"
+        )]
+        for m in meals
+    ])
+    await msg.edit_text("Tap a meal to log it again today:", reply_markup=keyboard)
+
+
+async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger = logging.getLogger(__name__)
+    query = update.callback_query
+    await query.answer()
+
+    page_id = query.data[len("relog_"):]
+    meal = context.bot_data.get("recent_meals", {}).get(page_id)
+    if not meal:
+        await query.edit_message_text("Meal data expired. Use /recent to refresh.")
+        return
+
+    meal_type = get_meal_type()
+    await query.edit_message_text(f"Logging {meal['name']}...")
+    try:
+        nutrition = NutritionData(
+            food_name=meal["name"],
+            portion_size=meal.get("portion_size", ""),
+            calories=meal["calories"],
+            protein_g=meal["protein_g"],
+            carbs_g=meal["carbs_g"],
+            fat_g=meal["fat_g"],
+            fiber_g=meal["fiber_g"],
+            sugar_g=meal["sugar_g"],
+            sodium_mg=meal["sodium_mg"],
+            confidence=meal.get("confidence", "High"),
+            confidence_pct=meal.get("confidence_pct", 90),
+            notes=meal.get("notes", "Re-logged from saved meals."),
+            recognizable=True,
+        )
+        today = date.today()
+        daily_log_id = await get_or_create_daily_log(today)
+        page_url = await create_food_entry(
+            nutrition, "", daily_log_id, today,
+            meal_type=meal_type, log_method="Re-log",
+        )
+        await query.edit_message_text(_build_summary(nutrition, page_url, meal_type))
+    except Exception:
+        logger.exception("Unexpected error in relog_callback")
+        await query.edit_message_text("Something went wrong. Please try again.")
+
+
+# ── /weight ───────────────────────────────────────────────────────────────────
+
+async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /weight 85  (your weight in kg)")
+        return
+    try:
+        weight = float(context.args[0].replace("kg", "").strip())
+    except ValueError:
+        await update.message.reply_text("Please enter a number, e.g. /weight 85")
+        return
+    if not (30 <= weight <= 300):
+        await update.message.reply_text("Please enter a weight between 30 and 300 kg.")
+        return
+
+    await log_weight(weight, date.today())
+
+    # Suggest updated macro targets based on weight
+    suggested_cal = round(weight * 33)
+    suggested_protein = round(weight * 2.0)
+    diff_cal = suggested_cal - config.DAILY_CALORIES_GOAL
+    diff_prot = suggested_protein - config.DAILY_PROTEIN_GOAL
+
+    lines = [f"Weight logged: {weight:.1f} kg"]
+    if abs(diff_cal) >= 50 or abs(diff_prot) >= 5:
+        sign_cal  = "+" if diff_cal  >= 0 else ""
+        sign_prot = "+" if diff_prot >= 0 else ""
+        lines += [
+            "",
+            "Based on your weight, suggested targets:",
+            f"Calories: {suggested_cal} kcal ({sign_cal}{diff_cal} vs current {config.DAILY_CALORIES_GOAL})",
+            f"Protein:  {suggested_protein}g ({sign_prot}{diff_prot} vs current {config.DAILY_PROTEIN_GOAL}g)",
+            "",
+            "To update: tell me the new values and I'll apply them.",
+        ]
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── /fasting ───────────────────────────────────────────────────────────────────
+
+async def fasting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    today_str = date.today().isoformat()
+    fasting_days: set = context.bot_data.setdefault("fasting_days", set())
+    if today_str in fasting_days:
+        fasting_days.discard(today_str)
+        await update.message.reply_text("Fasting mode OFF for today. Nudges and warnings re-enabled.")
+    else:
+        fasting_days.add(today_str)
+        await update.message.reply_text(
+            "Fasting mode ON for today.\n\n"
+            "Low-calorie warnings and lunch nudges are suppressed.\n"
+            "/summary will show a fasting day view.\n\n"
+            "Run /fasting again to turn it off."
+        )
+
+
+# ── /yesterday ─────────────────────────────────────────────────────────────────
+
+async def yesterday_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Fetching yesterday's meals...")
+    meals = await get_yesterday_meals()
+    if not meals:
+        yesterday = (date.today() - timedelta(days=1)).strftime("%b %d")
+        await msg.edit_text(f"No meals logged on {yesterday}.")
+        return
+
+    context.bot_data["yesterday_meals"] = meals
+    total_cal = sum(m["calories"] for m in meals)
+    yesterday = (date.today() - timedelta(days=1)).strftime("%b %d")
+    lines = [f"Yesterday ({yesterday}) — {total_cal:.0f} kcal total\n"]
+    for i, m in enumerate(meals):
+        tag = f"[{m['meal_type']}] " if m["meal_type"] else ""
+        lines.append(f"{tag}{m['name']} — {m['calories']:.0f} kcal")
+
+    keyboard_rows = []
+    for i, m in enumerate(meals):
+        label = f"{m['name'][:28]} ({m['calories']:.0f} kcal)"
+        keyboard_rows.append([InlineKeyboardButton(label, callback_data=f"copy_yday_{i}")])
+    keyboard_rows.append([InlineKeyboardButton("📋 Copy all to today", callback_data="copy_yday_all")])
+
+    await msg.edit_text(
+        "\n".join(lines) + "\n\nTap a meal to copy it to today:",
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+    )
+
+
+async def copy_yesterday_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    logger = logging.getLogger(__name__)
+    query = update.callback_query
+    await query.answer()
+
+    meals = context.bot_data.get("yesterday_meals", [])
+    if not meals:
+        await query.edit_message_text("Session expired. Run /yesterday again.")
+        return
+
+    today = date.today()
+    daily_log_id = await get_or_create_daily_log(today)
+    meal_type = get_meal_type()
+
+    if query.data == "copy_yday_all":
+        await query.edit_message_text(f"Copying {len(meals)} meals to today...")
+        count = 0
+        for meal in meals:
+            try:
+                n = NutritionData(
+                    food_name=meal["name"], portion_size=meal["portion_size"],
+                    calories=meal["calories"], protein_g=meal["protein_g"],
+                    carbs_g=meal["carbs_g"], fat_g=meal["fat_g"],
+                    fiber_g=meal["fiber_g"], sugar_g=meal["sugar_g"],
+                    sodium_mg=meal["sodium_mg"], confidence=meal["confidence"],
+                    notes=f"Copied from yesterday. {meal['notes']}".strip(),
+                    recognizable=True,
+                )
+                await create_food_entry(n, "", daily_log_id, today, meal_type=meal.get("meal_type") or meal_type)
+                count += 1
+            except Exception:
+                logger.exception("Error copying meal: %s", meal["name"])
+        await query.edit_message_text(f"Copied {count}/{len(meals)} meals to today.")
+    else:
+        idx = int(query.data.replace("copy_yday_", ""))
+        if idx >= len(meals):
+            await query.edit_message_text("Meal not found.")
+            return
+        meal = meals[idx]
+        n = NutritionData(
+            food_name=meal["name"], portion_size=meal["portion_size"],
+            calories=meal["calories"], protein_g=meal["protein_g"],
+            carbs_g=meal["carbs_g"], fat_g=meal["fat_g"],
+            fiber_g=meal["fiber_g"], sugar_g=meal["sugar_g"],
+            sodium_mg=meal["sodium_mg"], confidence=meal["confidence"],
+            notes=f"Copied from yesterday. {meal['notes']}".strip(),
+            recognizable=True,
+        )
+        try:
+            await create_food_entry(n, "", daily_log_id, today, meal_type=meal.get("meal_type") or meal_type)
+            await query.edit_message_text(f"Copied: {meal['name']} ({meal['calories']:.0f} kcal)")
+        except Exception:
+            logger.exception("Error copying meal")
+            await query.edit_message_text("Something went wrong. Please try again.")
+
+
+# ── /export ────────────────────────────────────────────────────────────────────
+
+async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    await update.message.reply_text(
+        "Choose export range:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Last 7 days",  callback_data="export_7")],
+            [InlineKeyboardButton("Last 30 days", callback_data="export_30")],
+            [InlineKeyboardButton("This month",   callback_data="export_month")],
+        ]),
+    )
+
+
+async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Generating export...")
+
+    today = date.today()
+    if query.data == "export_7":
+        start = today - timedelta(days=6)
+        label = "last_7_days"
+    elif query.data == "export_30":
+        start = today - timedelta(days=29)
+        label = "last_30_days"
+    else:
+        start = today.replace(day=1)
+        label = today.strftime("%Y_%m")
+
+    rows = await get_food_entries_range(start, today)
+    if not rows:
+        await query.edit_message_text("No entries found for that period.")
+        return
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "date", "meal_type", "log_method", "name",
+        "calories", "protein_g", "carbs_g", "fat_g",
+        "fiber_g", "sugar_g", "sodium_mg", "portion_size", "notes",
+    ])
+    writer.writeheader()
+    writer.writerows(rows)
+
+    file_bytes = buf.getvalue().encode("utf-8")
+    filename = f"food_log_{label}.csv"
+    await query.message.reply_document(
+        document=io.BytesIO(file_bytes),
+        filename=filename,
+        caption=f"Food log export — {start.isoformat()} to {today.isoformat()} ({len(rows)} entries)",
+    )
+    await query.edit_message_text(f"Export ready: {len(rows)} entries.")
+
+
+# ── Scheduled job callbacks ────────────────────────────────────────────────────
+
+async def nudge_lunch(context) -> None:
+    """Sent at 2pm local time if no meals logged today and not fasting."""
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id:
+        return
+    if _is_fasting(context.bot_data):
+        return
+    totals = await get_today_totals(date.today())
+    if totals and totals.get("calories", 0) > 100:
+        return  # already logged something
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Hey — you haven't logged anything yet today. Did you eat lunch? Use /log when ready.",
+    )
+
+
+async def check_incomplete_day(context) -> None:
+    """Sent at 8pm local time if calories < 60% of goal and not fasting."""
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id:
+        return
+    if _is_fasting(context.bot_data):
+        return
+    totals = await get_today_totals(date.today())
+    if not totals:
+        return
+    cal = totals.get("calories", 0)
+    if cal > 0 and cal < config.DAILY_CALORIES_GOAL * 0.6:
+        shortfall = int(config.DAILY_CALORIES_GOAL - cal)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"You've logged {cal:.0f} kcal today — {shortfall} kcal below your goal.\n\n"
+                "Did you forget to log something? Check /summary for details."
+            ),
+        )
+
+
+async def monthly_weighin_reminder(context) -> None:
+    """Sent on the 1st of each month as a weigh-in prompt."""
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id:
+        return
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Monthly weigh-in reminder!\n\n"
+            "Log your current weight with: /weight [kg]\n"
+            "e.g. /weight 85\n\n"
+            "I'll compare it to your macro targets and flag any adjustments."
+        ),
+    )
+
+
+# ── Fallback text ──────────────────────────────────────────────────────────────
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Use /log to record a meal — photo, barcode, restaurant, or ingredients.\n\n"
+        "/summary — today's macro progress\n"
+        "/recent  — re-log a saved meal\n"
+        "/water   — log water (e.g. /water 500)"
+    )
+
+
+# ── Weekly review check ────────────────────────────────────────────────────────
+
+async def _maybe_create_weekly_review(app: Application) -> None:
+    """Runs on startup. If it's Monday, creates last week's review page in Notion."""
+    if datetime.now().weekday() != 5:  # 5 = Saturday
+        return
+    if not config.NOTION_PARENT_PAGE_ID:
+        return
+    logger = logging.getLogger(__name__)
+    try:
+        week_data = await get_last_week_data()
+        if week_data.get("total_entries", 0) == 0:
+            return
+        page_url = await create_weekly_review_page(week_data)
+        if page_url:
+            logger.info("Weekly review created: %s", page_url)
+    except Exception:
+        logger.exception("Failed to create weekly review page")
+
+
+async def _ensure_weight_property() -> None:
+    """Adds Weight (kg) to Daily Log DB on first run if it doesn't exist yet."""
+    from notion_client import AsyncClient
+    import config as _cfg
+    notion = AsyncClient(auth=_cfg.NOTION_API_KEY)
+    try:
+        await notion.databases.update(
+            database_id=_cfg.NOTION_DAILY_DB_ID,
+            properties={"Weight (kg)": {"number": {"format": "number"}}},
+        )
+    except Exception:
+        pass  # Already exists or not critical
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Food Tracker Bot...")
+
+    async def post_init(application: Application) -> None:
+        await _maybe_create_weekly_review(application)
+        await _ensure_weight_property()
+
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("log", log_handler),
+            MessageHandler(filters.PHOTO, photo_entry),
+            MessageHandler(filters.VOICE, voice_entry),
+        ],
+        states={
+            WAITING_FOR_TEXT: [
+                CallbackQueryHandler(
+                    choice_callback,
+                    pattern="^log_(photo|text|restaurant|barcode|water|weight_menu)$"
+                ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ingredients_handler),
+            ],
+            WAITING_FOR_RESTAURANT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, restaurant_handler),
+            ],
+            WAITING_FOR_BARCODE: [
+                MessageHandler(filters.PHOTO, barcode_photo_handler),
+            ],
+            CHOOSING_SERVING_TYPE: [
+                CallbackQueryHandler(serving_type_callback, pattern="^serve_(home|restaurant)$"),
+            ],
+            CHOOSING_COOKING_CONTEXT: [
+                CallbackQueryHandler(
+                    cooking_context_callback,
+                    pattern="^cook_(raw|cooked|grilled|fried|boiled|skip)$"
+                ),
+            ],
+            CHOOSING_PORTION_SIZE: [
+                CallbackQueryHandler(portion_size_callback, pattern="^psize_(small|medium|large|custom)$"),
+            ],
+            ENTERING_CUSTOM_WEIGHT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, custom_weight_handler),
+            ],
+            CONFIRMING_ANALYSIS: [
+                CallbackQueryHandler(
+                    photo_confirm_callback,
+                    pattern="^photo_(confirm|correct|cancel|portion)$"
+                ),
+            ],
+            CORRECTING_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, photo_correction_handler),
+            ],
+            ADJUSTING_PORTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, portion_percentage_handler),
+            ],
+            WAITING_FOR_WATER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, water_amount_handler),
+            ],
+            WAITING_FOR_WEIGHT_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, weight_input_handler),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_handler)],
+        per_message=False,
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("start",     start_handler))
+    app.add_handler(CommandHandler("summary",   summary_handler))
+    app.add_handler(CommandHandler("water",     water_handler))
+    app.add_handler(CommandHandler("recent",    recent_handler))
+    app.add_handler(CommandHandler("weight",    weight_handler))
+    app.add_handler(CommandHandler("fasting",   fasting_handler))
+    app.add_handler(CommandHandler("yesterday", yesterday_handler))
+    app.add_handler(CommandHandler("export",    export_handler))
+    app.add_handler(CallbackQueryHandler(save_meal_callback,        pattern="^save_meal$"))
+    app.add_handler(CallbackQueryHandler(add_restaurant_callback,   pattern="^add_restaurant$"))
+    app.add_handler(CallbackQueryHandler(relog_callback,            pattern="^relog_"))
+    app.add_handler(CallbackQueryHandler(copy_yesterday_callback,   pattern="^copy_yday_"))
+    app.add_handler(CallbackQueryHandler(export_callback,           pattern="^export_(7|30|month)$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    # ── Scheduled nudges ──────────────────────────────────────────────────────
+    import datetime as _dt
+    tz_offset = _dt.timezone(timedelta(hours=config.TIMEZONE_HOURS))
+
+    def _local_to_utc(hour: int, minute: int = 0) -> _dt.time:
+        utc_hour = (hour - config.TIMEZONE_HOURS) % 24
+        return _dt.time(utc_hour, minute, tzinfo=_dt.timezone.utc)
+
+    jq = app.job_queue
+    jq.run_daily(nudge_lunch,            time=_local_to_utc(14, 0))   # 2:00pm local
+    jq.run_daily(check_incomplete_day,   time=_local_to_utc(20, 0))   # 8:00pm local
+    jq.run_monthly(monthly_weighin_reminder,                           # 1st of month 9am
+                   when=_local_to_utc(9, 0), day=1)
+
+    logger.info("Bot polling started.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
