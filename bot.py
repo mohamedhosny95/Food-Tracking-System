@@ -1548,6 +1548,52 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+# ── Render / health server ────────────────────────────────────────────────────
+
+def _start_health_server(port: int) -> None:
+    """Start a minimal HTTP server on PORT in a daemon thread.
+
+    Render (and similar hosts) require an open TCP port to confirm the process
+    is alive. This also provides a /health endpoint for the self-ping job.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path in ("/", "/health"):
+                body = b"OK"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args) -> None:
+            pass  # silence access logs
+
+    server = HTTPServer(("0.0.0.0", port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.getLogger(__name__).info("Health server started on port %d", port)
+
+
+async def self_ping(context) -> None:
+    """Ping our own /health endpoint every 10 min to prevent Render free-tier sleep."""
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not render_url:
+        return
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"{render_url}/health", timeout=10)
+        logging.getLogger(__name__).debug("Self-ping OK → %s/health", render_url)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Self-ping failed: %s", exc)
+
+
 # ── Weekly review check ────────────────────────────────────────────────────────
 
 async def _maybe_create_weekly_review(app: Application) -> None:
@@ -1709,6 +1755,9 @@ def main() -> None:
     jq.run_monthly(monthly_weighin_reminder,                           # 1st of month 9am
                    when=_local_to_utc(9, 0), day=1)
 
+    # Self-ping every 10 min to keep Render free-tier alive (no-op if not on Render)
+    jq.run_repeating(self_ping, interval=600, first=60)
+
     webhook_domain = os.environ.get("WEBHOOK_DOMAIN", "")
     port = int(os.environ.get("PORT", 8080))
 
@@ -1724,7 +1773,9 @@ def main() -> None:
             drop_pending_updates=True,
         )
     else:
-        logger.info("Bot starting in polling mode.")
+        # Polling mode — start health server so Render sees an open port
+        _start_health_server(port)
+        logger.info("Bot starting in polling mode (health server on port %d).", port)
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 

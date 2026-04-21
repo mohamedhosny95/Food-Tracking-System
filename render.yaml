@@ -1,0 +1,68 @@
+services:
+  - type: web
+    name: food-tracking-bot
+    runtime: python
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+
+    # Render sets PORT automatically — the bot's health server binds to it.
+    # RENDER_EXTERNAL_URL is set automatically — used by the self-ping job.
+    envVars:
+      # ── Required secrets (set these in the Render dashboard) ──────────────
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+      - key: GEMINI_API_KEY
+        sync: false
+
+      - key: NOTION_API_KEY
+        sync: false
+
+      - key: NOTION_FOOD_DB_ID
+        sync: false
+
+      - key: NOTION_DAILY_DB_ID
+        sync: false
+
+      # ── Optional Notion databases ─────────────────────────────────────────
+      - key: NOTION_RESTAURANTS_DB_ID
+        sync: false
+
+      - key: NOTION_SAVED_MEALS_DB_ID
+        sync: false
+
+      - key: NOTION_PARENT_PAGE_ID
+        sync: false
+
+      # ── Optional: Telegram user whitelist (comma-separated IDs) ──────────
+      - key: ALLOWED_USER_IDS
+        sync: false
+
+      # ── Macro & hydration goals (defaults shown — override if needed) ─────
+      - key: DAILY_CALORIES_GOAL
+        value: "2000"
+
+      - key: DAILY_PROTEIN_GOAL
+        value: "150"
+
+      - key: DAILY_CARBS_GOAL
+        value: "250"
+
+      - key: DAILY_FAT_GOAL
+        value: "65"
+
+      - key: DAILY_FIBER_GOAL
+        value: "30"
+
+      - key: DAILY_WATER_GOAL_ML
+        value: "2500"
+
+      # ── Timezone offset from UTC (e.g. 3 for UTC+3) ───────────────────────
+      - key: TIMEZONE_HOURS
+        value: "3"
+
+      # ── Low-calorie warning threshold (fraction of daily goal) ────────────
+      - key: LOW_CALORIE_THRESHOLD
+        value: "0.6"
