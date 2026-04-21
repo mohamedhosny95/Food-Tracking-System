@@ -1577,6 +1577,12 @@ async def monthly_weighin_reminder(context) -> None:
 # ── Fallback text ──────────────────────────────────────────────────────────────
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # If the user tapped ➕ Save New Template and then typed their description
+    # but the ConversationHandler state was lost (e.g. bot restarted), route it here.
+    if context.user_data.pop("awaiting_template_desc", False):
+        await template_new_description_handler(update, context)
+        return
+
     await update.message.reply_text(
         "Use /log to record a meal — photo, barcode, restaurant, or ingredients.\n\n"
         "/summary — today's macro progress\n"
@@ -1781,24 +1787,35 @@ async def template_custom_weight_handler(
 async def template_delete_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Delete a template then refresh the list in-place."""
+    """Delete a template then refresh the list in-place using the local cache.
+
+    We do NOT re-query Notion after archiving because Notion's index has eventual
+    consistency — the page would still appear in query results for a few seconds.
+    Instead we remove the entry from the local bot_data cache (done before the
+    Notion call) and rebuild the keyboard from that cache.
+    """
     query = update.callback_query
     await query.answer()
+    logger = logging.getLogger(__name__)
 
     page_id = query.data[len("del_tpl_"):]
-    # Optimistically remove from local cache
-    deleted_name = context.bot_data.get("template_meals", {}).pop(page_id, {}).get("name", "Meal")
+
+    # Remove from local cache FIRST — this is what we'll display
+    cache: dict = context.bot_data.setdefault("template_meals", {})
+    deleted_name = cache.pop(page_id, {}).get("name", "Meal")
 
     try:
         await delete_saved_meal(page_id)
+        logger.info("Deleted template %s ('%s')", page_id, deleted_name)
     except Exception:
-        logging.getLogger(__name__).exception("Failed to delete template %s", page_id)
-        await query.answer("Could not delete. Try again.", show_alert=True)
+        logger.exception("Failed to delete template %s", page_id)
+        # Restore the item in cache so the list stays consistent
+        await query.answer("Could not delete from Notion. Try again.", show_alert=True)
         return TEMPLATE_CHOOSING_PORTION
 
-    # Refresh list from Notion
-    meals = await get_saved_meals()
-    if not meals:
+    # Rebuild from the now-updated local cache (no Notion round-trip needed)
+    remaining = list(cache.values())
+    if not remaining:
         await query.edit_message_text(
             f'🗑️ "{deleted_name}" deleted.\n\n'
             "No templates left. Tap ➕ to add one.",
@@ -1808,12 +1825,9 @@ async def template_delete_callback(
         )
         return TEMPLATE_CHOOSING_PORTION
 
-    context.bot_data.setdefault("template_meals", {}).update(
-        {m["page_id"]: m for m in meals}
-    )
     await query.edit_message_text(
         f'🗑️ "{deleted_name}" deleted.\n\nTap a meal to log  ·  🗑️ to delete  ·  ➕ to add new:',
-        reply_markup=_templates_keyboard(meals),
+        reply_markup=_templates_keyboard(remaining),
     )
     return TEMPLATE_CHOOSING_PORTION
 
@@ -1821,9 +1835,16 @@ async def template_delete_callback(
 async def template_add_new_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """User taps ➕ — ask them to describe the meal."""
+    """User taps ➕ — ask them to describe the meal.
+
+    Works both inside the ConversationHandler (returns TEMPLATE_SAVING_NEW)
+    and as a standalone global handler (uses user_data flag instead).
+    """
     query = update.callback_query
     await query.answer()
+    # Flag so the global text_handler can route the next message if the
+    # ConversationHandler state has been lost (e.g. after a bot restart).
+    context.user_data["awaiting_template_desc"] = True
     await query.edit_message_text(
         "Describe the meal you want to save as a template.\n\n"
         "Examples:\n"
@@ -1838,6 +1859,7 @@ async def template_new_description_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     """Receives the description, runs AI analysis, shows a save-confirmation card."""
+    context.user_data.pop("awaiting_template_desc", None)  # clear the flag
     description = update.message.text.strip()
     msg = await update.message.reply_text("🤖 Analyzing with AI...")
 
@@ -1869,7 +1891,12 @@ async def template_new_description_handler(
 async def template_new_confirm_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Handles ✅ Save Template / ❌ Cancel from the new-template confirmation card."""
+    """Handles ✅ Save Template / ❌ Cancel from the new-template confirmation card.
+
+    Registered both inside the ConversationHandler (TEMPLATE_SAVING_NEW state)
+    AND as a standalone global handler so it works even when the bot has restarted
+    and conversation state has been lost from memory.
+    """
     query = update.callback_query
     await query.answer()
 
@@ -1879,17 +1906,21 @@ async def template_new_confirm_callback(
 
     nutrition: NutritionData | None = context.user_data.pop("template_new_nutrition", None)
     if not nutrition:
-        await query.edit_message_text("Session expired. Use /templates to try again.")
+        await query.edit_message_text(
+            "❌ Session data was lost (the bot may have restarted).\n\n"
+            "Use /templates → ➕ Save New Template to try again."
+        )
         return ConversationHandler.END
 
     try:
         await save_to_saved_meals(nutrition)
         await query.edit_message_text(
             f'✅ "{nutrition.food_name}" saved to templates!\n\n'
-            f"Use /templates to log it next time."
+            "Use /templates to log it any time."
         )
     except Exception as exc:
-        await query.edit_message_text(f"Failed to save: {exc}")
+        logging.getLogger(__name__).exception("save_to_saved_meals failed")
+        await query.edit_message_text(f"Failed to save to Notion: {exc}")
 
     return ConversationHandler.END
 
@@ -2311,6 +2342,11 @@ def main() -> None:
     # Goals callbacks that appear outside the conversation (e.g. "Edit another" tap)
     app.add_handler(CallbackQueryHandler(goals_edit_menu_callback, pattern="^goals_edit_menu$"))
     app.add_handler(CallbackQueryHandler(goals_pick_callback,      pattern="^goal_set_"))
+    # Template callbacks registered globally so they work even if the bot was
+    # restarted mid-flow and conversation state has been lost from memory.
+    app.add_handler(CallbackQueryHandler(template_add_new_callback,     pattern="^templates_add_new$"))
+    app.add_handler(CallbackQueryHandler(template_new_confirm_callback, pattern="^tpl_(save_confirm|save_cancel)$"))
+    app.add_handler(CallbackQueryHandler(template_delete_callback,      pattern="^del_tpl_"))
     app.add_handler(CallbackQueryHandler(save_meal_callback,        pattern="^save_meal$"))
     app.add_handler(CallbackQueryHandler(add_restaurant_callback,   pattern="^add_restaurant$"))
     app.add_handler(CallbackQueryHandler(relog_callback,            pattern="^relog_"))
