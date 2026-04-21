@@ -45,6 +45,9 @@ from notion_helper import (
     get_food_entries_range,
     set_fasting_status,
     get_fasting_status,
+    get_daily_totals_range,
+    get_user_goals,
+    save_user_goals,
 )
 
 
@@ -88,7 +91,30 @@ def is_authorized(user_id: int) -> bool:
     WAITING_FOR_WATER,           # water: user types quantity in ml
     WAITING_FOR_WEIGHT_INPUT,    # weight: user types body weight in kg
     EDITING_MACROS,              # user typing updated protein/carbs/fat values
-) = range(13)
+    TEMPLATE_CHOOSING_PORTION,   # templates: picking Small/Medium/Large/Custom
+    TEMPLATE_ENTERING_WEIGHT,    # templates: typing custom gram weight
+    SETTING_GOALS,               # /goals: user typing a new goal value
+) = range(16)
+
+
+# ── Goal metadata ──────────────────────────────────────────────────────────────
+
+GOAL_META: dict[str, tuple[str, str, str]] = {
+    # key → (label, unit, config attribute name)
+    "calories":  ("🔥 Calories",  "kcal", "DAILY_CALORIES_GOAL"),
+    "protein_g": ("💪 Protein",   "g",    "DAILY_PROTEIN_GOAL"),
+    "carbs_g":   ("🍞 Carbs",     "g",    "DAILY_CARBS_GOAL"),
+    "fat_g":     ("🥑 Fat",       "g",    "DAILY_FAT_GOAL"),
+    "fiber_g":   ("🥦 Fiber",     "g",    "DAILY_FIBER_GOAL"),
+    "water_ml":  ("💧 Water",     "ml",   "DAILY_WATER_GOAL_ML"),
+}
+
+
+def _get_goal(bot_data: dict, key: str) -> int:
+    """Return the user-set goal if saved, otherwise fall back to config default."""
+    cfg_attr = GOAL_META[key][2]
+    default = getattr(config, cfg_attr, 0)
+    return int(bot_data.get("goals", {}).get(key, default))
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -153,36 +179,39 @@ async def _load_fasting_from_notion(bot_data: dict) -> bool:
     return is_fasting
 
 
-def _build_daily_summary(totals: dict, fasting: bool = False) -> str:
+def _build_daily_summary(totals: dict, fasting: bool = False, bot_data: dict | None = None) -> str:
+    bd = bot_data or {}
+
     def row(label: str, val: float, goal: int, unit: str) -> str:
         bar = _progress_bar(val, goal)
         pct = min(int(val / goal * 100), 100) if goal > 0 else 0
         rem = max(goal - val, 0)
         return f"{label}\n{bar} {val:.0f}/{goal}{unit} ({pct}%) — {rem:.0f}{unit} left"
 
-    cal = totals.get("calories", 0)
-    header = "Today's Progress  🌙 Fasting Day" if fasting else "Today's Progress"
+    cal      = totals.get("calories", 0)
+    cal_goal = _get_goal(bd, "calories")
+    header   = "Today's Progress  🌙 Fasting Day" if fasting else "Today's Progress"
 
-    # Incomplete day warning: after 8pm local, if <60% of calorie goal and not fasting
+    # Incomplete day warning: after 8pm local, if <threshold% of calorie goal and not fasting
     local_hour = (datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_HOURS)).hour
     warning = ""
-    if not fasting and local_hour >= 20 and cal < config.DAILY_CALORIES_GOAL * config.LOW_CALORIE_THRESHOLD:
-        shortfall = int(config.DAILY_CALORIES_GOAL - cal)
+    if not fasting and local_hour >= 20 and cal < cal_goal * config.LOW_CALORIE_THRESHOLD:
+        shortfall = int(cal_goal - cal)
         warning = f"\n\nYou're {shortfall} kcal below your goal — did you forget to log something?"
 
     lines = [header]
     if not fasting:
         lines += [
             "",
-            row("Calories", cal,                          config.DAILY_CALORIES_GOAL, " kcal"),
-            row("Protein ", totals.get("protein_g", 0),   config.DAILY_PROTEIN_GOAL,  "g"),
-            row("Carbs   ", totals.get("carbs_g", 0),     config.DAILY_CARBS_GOAL,    "g"),
-            row("Fat     ", totals.get("fat_g", 0),       config.DAILY_FAT_GOAL,      "g"),
-            row("Fiber   ", totals.get("fiber_g", 0),     config.DAILY_FIBER_GOAL,    "g"),
+            row("Calories", cal,                          cal_goal,                     " kcal"),
+            row("Protein ", totals.get("protein_g", 0),   _get_goal(bd, "protein_g"),   "g"),
+            row("Carbs   ", totals.get("carbs_g", 0),     _get_goal(bd, "carbs_g"),     "g"),
+            row("Fat     ", totals.get("fat_g", 0),       _get_goal(bd, "fat_g"),       "g"),
+            row("Fiber   ", totals.get("fiber_g", 0),     _get_goal(bd, "fiber_g"),     "g"),
             "",
             f"Sugar:  {totals.get('sugar_g', 0):.0f}g    Sodium: {totals.get('sodium_mg', 0):.0f}mg",
         ]
-    lines += ["", row("Water", totals.get("water_ml", 0), config.DAILY_WATER_GOAL_ML, " ml")]
+    lines += ["", row("Water", totals.get("water_ml", 0), _get_goal(bd, "water_ml"),   " ml")]
 
     if totals.get("weight_kg"):
         lines += [f"\nWeight: {totals['weight_kg']:.1f} kg"]
@@ -233,12 +262,15 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Food Tracker ready.\n\n"
         "Send a photo or voice message to log a meal, or use /log.\n\n"
-        "/summary  — today's macro progress\n"
-        "/recent   — re-log a saved meal\n"
+        "/summary   — today's macro progress\n"
+        "/recent    — re-log a saved meal\n"
         "/yesterday — copy yesterday's meals\n"
-        "/weight   — log your body weight (e.g. /weight 85)\n"
-        "/fasting  — toggle fasting mode for today\n"
-        "/export   — export your food log as CSV"
+        "/templates — quick-log a saved meal template\n"
+        "/chart     — 7-day calorie trend chart\n"
+        "/goals     — view or update macro goals\n"
+        "/weight    — log your body weight (e.g. /weight 85)\n"
+        "/fasting   — toggle fasting mode for today\n"
+        "/export    — export your food log as CSV"
     )
 
 
@@ -1151,7 +1183,7 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not totals and not fasting:
         await msg.edit_text("No meals logged today yet. Use /log to add your first meal.")
         return
-    await msg.edit_text(_build_daily_summary(totals or {}, fasting=fasting))
+    await msg.edit_text(_build_daily_summary(totals or {}, fasting=fasting, bot_data=context.bot_data))
 
 
 # ── /water ────────────────────────────────────────────────────────────────────
@@ -1492,23 +1524,26 @@ async def check_incomplete_day(context) -> None:
     if not totals:
         return
 
-    cal    = totals.get("calories",  0)
-    prot   = totals.get("protein_g", 0)
-    fiber  = totals.get("fiber_g",   0)
+    cal        = totals.get("calories",  0)
+    prot       = totals.get("protein_g", 0)
+    fiber      = totals.get("fiber_g",   0)
+    cal_goal   = _get_goal(context.bot_data, "calories")
+    prot_goal  = _get_goal(context.bot_data, "protein_g")
+    fiber_goal = _get_goal(context.bot_data, "fiber_g")
 
     nudges: list[str] = []
 
-    if cal > 0 and cal < config.DAILY_CALORIES_GOAL * config.LOW_CALORIE_THRESHOLD:
-        shortfall = int(config.DAILY_CALORIES_GOAL - cal)
-        nudges.append(f"🔥 Calories: {cal:.0f}/{config.DAILY_CALORIES_GOAL} kcal — {shortfall} kcal short")
+    if cal > 0 and cal < cal_goal * config.LOW_CALORIE_THRESHOLD:
+        shortfall = int(cal_goal - cal)
+        nudges.append(f"🔥 Calories: {cal:.0f}/{cal_goal} kcal — {shortfall} kcal short")
 
-    if config.DAILY_PROTEIN_GOAL > 0 and prot < config.DAILY_PROTEIN_GOAL * config.LOW_CALORIE_THRESHOLD:
-        shortfall_p = int(config.DAILY_PROTEIN_GOAL - prot)
-        nudges.append(f"💪 Protein: {prot:.0f}/{config.DAILY_PROTEIN_GOAL}g — {shortfall_p}g short")
+    if prot_goal > 0 and prot < prot_goal * config.LOW_CALORIE_THRESHOLD:
+        shortfall_p = int(prot_goal - prot)
+        nudges.append(f"💪 Protein: {prot:.0f}/{prot_goal}g — {shortfall_p}g short")
 
-    if config.DAILY_FIBER_GOAL > 0 and fiber < config.DAILY_FIBER_GOAL * config.LOW_CALORIE_THRESHOLD:
-        shortfall_f = int(config.DAILY_FIBER_GOAL - fiber)
-        nudges.append(f"🌿 Fiber: {fiber:.0f}/{config.DAILY_FIBER_GOAL}g — {shortfall_f}g short")
+    if fiber_goal > 0 and fiber < fiber_goal * config.LOW_CALORIE_THRESHOLD:
+        shortfall_f = int(fiber_goal - fiber)
+        nudges.append(f"🌿 Fiber: {fiber:.0f}/{fiber_goal}g — {shortfall_f}g short")
 
     if nudges:
         await context.bot.send_message(
@@ -1546,6 +1581,381 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/recent  — re-log a saved meal\n"
         "/water   — log water (e.g. /water 500)"
     )
+
+
+# ── /templates ────────────────────────────────────────────────────────────────
+
+async def templates_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    msg = await update.message.reply_text("Loading your saved meals...")
+    meals = await get_saved_meals()
+    if not meals:
+        await msg.edit_text(
+            "No saved templates yet.\n\n"
+            "Log a meal then tap ⭐ to save it as a template."
+        )
+        return ConversationHandler.END
+
+    context.bot_data.setdefault("template_meals", {}).update(
+        {m["page_id"]: m for m in meals}
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{m['name'][:28]}  {m['calories']:.0f} kcal"
+            + (f"  ×{m['times_logged']}" if m.get("times_logged") else ""),
+            callback_data=f"tpl_{m['page_id']}"
+        )]
+        for m in meals
+    ])
+    await msg.edit_text("Tap a meal to log it instantly:", reply_markup=keyboard)
+    return TEMPLATE_CHOOSING_PORTION
+
+
+async def template_select_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    page_id = query.data[len("tpl_"):]
+    meal = context.bot_data.get("template_meals", {}).get(page_id)
+    if not meal:
+        await query.edit_message_text("Meal data expired. Use /templates to refresh.")
+        return ConversationHandler.END
+
+    context.user_data["template_meal"] = meal
+
+    # Try to parse a gram weight from the portion_size string (e.g. "100g")
+    import re as _re
+    m = _re.search(r"(\d+(?:\.\d+)?)\s*g", meal.get("portion_size", ""), _re.I)
+    est_g = float(m.group(1)) if m else 0.0
+    context.user_data["template_est_g"] = est_g
+
+    await query.edit_message_text(
+        f"{meal['name']}\n"
+        f"Calories: {meal['calories']:.0f} kcal  |  Protein: {meal.get('protein_g', 0):.1f}g  "
+        f"|  Carbs: {meal.get('carbs_g', 0):.1f}g  |  Fat: {meal.get('fat_g', 0):.1f}g\n\n"
+        f"📏 How much are you having?",
+        reply_markup=_portion_size_keyboard(est_g),
+    )
+    return TEMPLATE_CHOOSING_PORTION
+
+
+async def template_portion_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    query = update.callback_query
+    await query.answer()
+
+    meal = context.user_data.get("template_meal")
+    if not meal:
+        await query.edit_message_text("Session expired. Use /templates again.")
+        return ConversationHandler.END
+
+    est_g = context.user_data.get("template_est_g", 0.0)
+
+    if query.data == "psize_custom":
+        hint = f" (saved as {int(est_g)}g)" if est_g else ""
+        await query.edit_message_text(
+            f"Enter the weight in grams{hint}:\n\nExample: 150"
+        )
+        return TEMPLATE_ENTERING_WEIGHT
+
+    factor_map = {
+        "psize_small":  config.PORTION_SMALL_FACTOR,
+        "psize_medium": 1.0,
+        "psize_large":  config.PORTION_LARGE_FACTOR,
+    }
+    factor = factor_map.get(query.data, 1.0)
+
+    nutrition = NutritionData(
+        food_name=meal["name"],
+        portion_size=meal.get("portion_size", ""),
+        calories=meal["calories"],
+        protein_g=meal.get("protein_g", 0),
+        carbs_g=meal.get("carbs_g", 0),
+        fat_g=meal.get("fat_g", 0),
+        fiber_g=meal.get("fiber_g", 0),
+        sugar_g=meal.get("sugar_g", 0),
+        sodium_mg=meal.get("sodium_mg", 0),
+        confidence="High",
+        confidence_pct=95,
+        notes="Logged from template.",
+        recognizable=True,
+        source="Template",
+    )
+
+    if factor != 1.0:
+        _scale_nutrition(nutrition, factor)
+        if est_g > 0:
+            nutrition.portion_size = f"~{int(est_g * factor)}g"
+        else:
+            nutrition.portion_size = f"{int(factor * 100)}% of {nutrition.portion_size}"
+
+    meal_type = get_meal_type()
+    await query.edit_message_text("Logging...")
+    try:
+        await _log_and_show(
+            query.message, nutrition,
+            meal_type=meal_type, log_method="Template", context=context,
+        )
+    except Exception:
+        logger.exception("Error logging template meal")
+        await query.edit_message_text("Something went wrong. Please try again.")
+    return ConversationHandler.END
+
+
+async def template_custom_weight_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    logger = logging.getLogger(__name__)
+    meal = context.user_data.get("template_meal")
+    if not meal:
+        await update.message.reply_text("Session expired. Use /templates again.")
+        return ConversationHandler.END
+
+    raw = update.message.text.strip().replace("g", "").strip()
+    try:
+        user_g = float(raw)
+    except ValueError:
+        await update.message.reply_text("Please enter a number in grams, e.g. 150")
+        return TEMPLATE_ENTERING_WEIGHT
+
+    if not (config.MIN_CUSTOM_WEIGHT_G <= user_g <= config.MAX_CUSTOM_WEIGHT_G):
+        await update.message.reply_text(
+            f"Please enter between {config.MIN_CUSTOM_WEIGHT_G}g and {config.MAX_CUSTOM_WEIGHT_G}g."
+        )
+        return TEMPLATE_ENTERING_WEIGHT
+
+    est_g = context.user_data.get("template_est_g", 0.0)
+    factor = user_g / est_g if est_g > 0 else 1.0
+
+    nutrition = NutritionData(
+        food_name=meal["name"],
+        portion_size=f"{int(user_g)}g",
+        calories=meal["calories"] * factor,
+        protein_g=meal.get("protein_g", 0) * factor,
+        carbs_g=meal.get("carbs_g", 0) * factor,
+        fat_g=meal.get("fat_g", 0) * factor,
+        fiber_g=meal.get("fiber_g", 0) * factor,
+        sugar_g=meal.get("sugar_g", 0) * factor,
+        sodium_mg=meal.get("sodium_mg", 0) * factor,
+        confidence="High", confidence_pct=95,
+        notes=f"Template, custom weight: {int(user_g)}g.",
+        recognizable=True, source="Template",
+    )
+
+    meal_type = get_meal_type()
+    status = await update.message.reply_text("Logging...")
+    try:
+        await _log_and_show(
+            status, nutrition,
+            meal_type=meal_type, log_method="Template", context=context,
+        )
+    except Exception:
+        logger.exception("Error logging template with custom weight")
+        await status.edit_text("Something went wrong. Please try again.")
+    return ConversationHandler.END
+
+
+# ── /chart ─────────────────────────────────────────────────────────────────────
+
+def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
+    import io as _io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels   = [d["date"].strftime("%a\n%b %d") for d in data]
+    calories = [d["calories"] for d in data]
+
+    colors = []
+    for cal in calories:
+        if cal == 0:
+            colors.append("#444455")
+        elif cal >= cal_goal * 0.9:
+            colors.append("#4CAF50")
+        elif cal >= cal_goal * 0.6:
+            colors.append("#FF9800")
+        else:
+            colors.append("#f44336")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor("#1a1a2e")
+    ax.set_facecolor("#16213e")
+
+    bars = ax.bar(range(len(labels)), calories, color=colors, width=0.6, zorder=3)
+    ax.axhline(y=cal_goal, color="#ffffff", linestyle="--",
+               linewidth=1.5, alpha=0.6, label=f"Goal: {cal_goal} kcal", zorder=4)
+
+    for bar, cal in zip(bars, calories):
+        if cal > 0:
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + cal_goal * 0.01,
+                f"{int(cal)}", ha="center", va="bottom",
+                color="white", fontsize=9, fontweight="bold",
+            )
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, color="#cccccc", fontsize=10)
+    ax.set_ylabel("Calories (kcal)", color="#cccccc", fontsize=11)
+    ax.tick_params(axis="y", colors="#cccccc")
+    ax.set_title("Calorie Intake — Last 7 Days", color="white",
+                 fontsize=14, fontweight="bold", pad=15)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["bottom", "left"]:
+        ax.spines[spine].set_color("#444")
+    ax.yaxis.grid(True, color="#333", zorder=0)
+    ax.set_axisbelow(True)
+    ax.legend(loc="upper right", facecolor="#1a1a2e",
+              labelcolor="white", edgecolor="#444", fontsize=10)
+
+    plt.tight_layout()
+    buf = _io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150,
+                bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+async def chart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    msg = await update.message.reply_text("Building your chart...")
+    today = date.today()
+    data  = await get_daily_totals_range(today - timedelta(days=6), today)
+    cal_goal = _get_goal(context.bot_data, "calories")
+
+    buf = _generate_calorie_chart(data, cal_goal)
+
+    logged = [d for d in data if d["calories"] > 0]
+    avg    = sum(d["calories"] for d in logged) / len(logged) if logged else 0
+    on_goal = sum(1 for d in data if d["calories"] >= cal_goal * 0.9)
+
+    caption = (
+        f"Last 7 days\n"
+        f"📊 Average: {avg:.0f} kcal\n"
+        f"✅ Days on goal: {on_goal}/7"
+    )
+    await msg.delete()
+    await update.message.reply_photo(photo=buf, caption=caption)
+
+
+# ── /goals ─────────────────────────────────────────────────────────────────────
+
+def _goals_text(bot_data: dict) -> str:
+    lines = ["📊 Your Daily Goals\n"]
+    for key, (label, unit, _) in GOAL_META.items():
+        val = _get_goal(bot_data, key)
+        lines.append(f"{label}: {val} {unit}")
+    return "\n".join(lines)
+
+
+async def goals_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        _goals_text(context.bot_data),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✏️ Edit a goal", callback_data="goals_edit_menu")
+        ]]),
+    )
+    return SETTING_GOALS
+
+
+async def goals_edit_menu_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔥 Calories",  callback_data="goal_set_calories"),
+            InlineKeyboardButton("💪 Protein",   callback_data="goal_set_protein_g"),
+        ],
+        [
+            InlineKeyboardButton("🍞 Carbs",     callback_data="goal_set_carbs_g"),
+            InlineKeyboardButton("🥑 Fat",       callback_data="goal_set_fat_g"),
+        ],
+        [
+            InlineKeyboardButton("🥦 Fiber",     callback_data="goal_set_fiber_g"),
+            InlineKeyboardButton("💧 Water",     callback_data="goal_set_water_ml"),
+        ],
+        [InlineKeyboardButton("❌ Cancel",        callback_data="goal_set_cancel")],
+    ])
+    await query.edit_message_text("Which goal do you want to update?", reply_markup=keyboard)
+    return SETTING_GOALS
+
+
+async def goals_pick_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "goal_set_cancel":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+    goal_key = query.data[len("goal_set_"):]   # e.g. "calories"
+    if goal_key not in GOAL_META:
+        await query.edit_message_text("Unknown goal. Try /goals again.")
+        return ConversationHandler.END
+
+    label, unit, _ = GOAL_META[goal_key]
+    current = _get_goal(context.bot_data, goal_key)
+    context.user_data["editing_goal"] = goal_key
+
+    await query.edit_message_text(
+        f"{label}\n"
+        f"Current: {current} {unit}\n\n"
+        f"Type your new goal ({unit}):"
+    )
+    return SETTING_GOALS
+
+
+async def goals_input_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    goal_key = context.user_data.get("editing_goal")
+    if not goal_key or goal_key not in GOAL_META:
+        await update.message.reply_text("Session expired. Use /goals again.")
+        return ConversationHandler.END
+
+    label, unit, _ = GOAL_META[goal_key]
+    raw = update.message.text.strip().replace(unit, "").strip()
+    try:
+        new_val = int(float(raw))
+        assert new_val > 0
+    except (ValueError, AssertionError):
+        await update.message.reply_text(f"Please enter a positive number in {unit}.")
+        return SETTING_GOALS
+
+    goals: dict = dict(context.bot_data.get("goals", {}))
+    goals[goal_key] = new_val
+    context.bot_data["goals"] = goals
+    await save_user_goals(goals)
+    context.user_data.pop("editing_goal", None)
+
+    await update.message.reply_text(
+        f"✅ {label} goal updated to {new_val} {unit}\n\n"
+        + _goals_text(context.bot_data),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✏️ Edit another", callback_data="goals_edit_menu")
+        ]]),
+    )
+    return SETTING_GOALS
 
 
 # ── Render / health server ────────────────────────────────────────────────────
@@ -1615,7 +2025,7 @@ async def _maybe_create_weekly_review(app: Application) -> None:
 
 
 async def _ensure_weight_property() -> None:
-    """Adds Weight (kg) and Fasting to Daily Log DB on first run if they don't exist yet."""
+    """Adds Weight (kg), Fasting, and goal number props to Daily Log DB on first run."""
     from notion_client import AsyncClient
     import config as _cfg
     notion = AsyncClient(auth=_cfg.NOTION_API_KEY)
@@ -1623,8 +2033,15 @@ async def _ensure_weight_property() -> None:
         await notion.databases.update(
             database_id=_cfg.NOTION_DAILY_DB_ID,
             properties={
-                "Weight (kg)": {"number": {"format": "number"}},
-                "Fasting":     {"checkbox": {}},
+                "Weight (kg)":        {"number": {"format": "number"}},
+                "Fasting":            {"checkbox": {}},
+                # Goal overrides stored on the special ⚙️ Goals page
+                "Goal Calories":      {"number": {"format": "number"}},
+                "Goal Protein (g)":   {"number": {"format": "number"}},
+                "Goal Carbs (g)":     {"number": {"format": "number"}},
+                "Goal Fat (g)":       {"number": {"format": "number"}},
+                "Goal Fiber (g)":     {"number": {"format": "number"}},
+                "Goal Water (ml)":    {"number": {"format": "number"}},
             },
         )
     except Exception:
@@ -1644,18 +2061,30 @@ def main() -> None:
             BotCommand("summary",   "Today's macro progress"),
             BotCommand("recent",    "Re-log a saved meal"),
             BotCommand("yesterday", "Copy yesterday's meals"),
+            BotCommand("templates", "Quick-log a saved meal template"),
+            BotCommand("chart",     "7-day calorie trend chart"),
+            BotCommand("goals",     "View or update macro goals"),
             BotCommand("fasting",   "Toggle fasting mode for today"),
             BotCommand("export",    "Export your food log as CSV"),
         ])
         await _maybe_create_weekly_review(application)
         await _ensure_weight_property()
         await _load_fasting_from_notion(application.bot_data)
+        # Load persisted user goals from Notion
+        try:
+            goals = await get_user_goals()
+            if goals:
+                application.bot_data["goals"] = goals
+        except Exception:
+            pass  # Fall back to config defaults
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler("log", log_handler),
+            CommandHandler("log",       log_handler),
+            CommandHandler("templates", templates_handler),
+            CommandHandler("goals",     goals_handler),
             MessageHandler(filters.PHOTO, photo_entry),
             MessageHandler(filters.VOICE, voice_entry),
         ],
@@ -1711,6 +2140,18 @@ def main() -> None:
             WAITING_FOR_WEIGHT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, weight_input_handler),
             ],
+            TEMPLATE_CHOOSING_PORTION: [
+                CallbackQueryHandler(template_select_callback,  pattern="^tpl_"),
+                CallbackQueryHandler(template_portion_callback, pattern="^psize_(small|medium|large|custom)$"),
+            ],
+            TEMPLATE_ENTERING_WEIGHT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, template_custom_weight_handler),
+            ],
+            SETTING_GOALS: [
+                CallbackQueryHandler(goals_edit_menu_callback, pattern="^goals_edit_menu$"),
+                CallbackQueryHandler(goals_pick_callback,      pattern="^goal_set_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, goals_input_handler),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_handler)],
         per_message=False,
@@ -1726,6 +2167,10 @@ def main() -> None:
     app.add_handler(CommandHandler("fasting",   fasting_handler))
     app.add_handler(CommandHandler("yesterday", yesterday_handler))
     app.add_handler(CommandHandler("export",    export_handler))
+    app.add_handler(CommandHandler("chart",     chart_handler))
+    # Goals callbacks that appear outside the conversation (e.g. "Edit another" tap)
+    app.add_handler(CallbackQueryHandler(goals_edit_menu_callback, pattern="^goals_edit_menu$"))
+    app.add_handler(CallbackQueryHandler(goals_pick_callback,      pattern="^goal_set_"))
     app.add_handler(CallbackQueryHandler(save_meal_callback,        pattern="^save_meal$"))
     app.add_handler(CallbackQueryHandler(add_restaurant_callback,   pattern="^add_restaurant$"))
     app.add_handler(CallbackQueryHandler(relog_callback,            pattern="^relog_"))

@@ -517,6 +517,124 @@ async def get_yesterday_meals() -> list[dict]:
     return meals
 
 
+# ── Chart data ────────────────────────────────────────────────────────────────
+
+async def get_daily_totals_range(start: date, end: date) -> list[dict]:
+    """Return daily calorie/macro totals for every day in [start, end]."""
+    response = await notion.databases.query(
+        database_id=config.NOTION_DAILY_DB_ID,
+        filter={
+            "and": [
+                {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
+                {"property": "Date", "date": {"on_or_before": end.isoformat()}},
+            ]
+        },
+        sorts=[{"property": "Date", "direction": "ascending"}],
+        page_size=50,
+    )
+
+    def _rollup(props: dict, name: str) -> float:
+        prop = props.get(name, {})
+        if prop.get("type") == "rollup":
+            return float(prop.get("rollup", {}).get("number") or 0)
+        if prop.get("type") == "number":
+            return float(prop.get("number") or 0)
+        return 0.0
+
+    by_date: dict[date, dict] = {}
+    for page in response["results"]:
+        props = page["properties"]
+        date_raw = (props.get("Date", {}).get("date") or {}).get("start", "")
+        if not date_raw:
+            continue
+        try:
+            page_date = date.fromisoformat(date_raw)
+        except ValueError:
+            continue
+        by_date[page_date] = {
+            "date":      page_date,
+            "calories":  _rollup(props, "Total Calories"),
+            "protein_g": _rollup(props, "Total Protein"),
+            "carbs_g":   _rollup(props, "Total Carbs"),
+            "fat_g":     _rollup(props, "Total Fat"),
+            "fiber_g":   _rollup(props, "Total Fiber"),
+            "water_ml":  float(props.get("Water (ml)", {}).get("number") or 0),
+        }
+
+    result = []
+    current = start
+    while current <= end:
+        result.append(by_date.get(current, {
+            "date": current, "calories": 0, "protein_g": 0,
+            "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "water_ml": 0,
+        }))
+        current += timedelta(days=1)
+    return result
+
+
+# ── User goals (persisted in Notion) ──────────────────────────────────────────
+
+_GOAL_PROPS = {
+    "Goal Calories": "calories",
+    "Goal Protein":  "protein_g",
+    "Goal Carbs":    "carbs_g",
+    "Goal Fat":      "fat_g",
+    "Goal Fiber":    "fiber_g",
+    "Goal Water":    "water_ml",
+}
+_GOALS_PAGE_NAME = "⚙️ Goals"
+
+
+async def get_user_goals() -> dict:
+    """Read custom macro goals stored as a special page in the Daily Log DB."""
+    try:
+        response = await notion.databases.query(
+            database_id=config.NOTION_DAILY_DB_ID,
+            filter={"property": "Name", "title": {"equals": _GOALS_PAGE_NAME}},
+        )
+        if not response["results"]:
+            return {}
+        props = response["results"][0]["properties"]
+        goals = {}
+        for notion_key, goal_key in _GOAL_PROPS.items():
+            val = props.get(notion_key, {}).get("number")
+            if val is not None:
+                goals[goal_key] = int(val)
+        return goals
+    except Exception as exc:
+        logger.warning("Could not load user goals from Notion: %s", exc)
+        return {}
+
+
+async def save_user_goals(goals: dict) -> None:
+    """Persist updated macro goals to the ⚙️ Goals page in the Daily Log DB."""
+    properties: dict = {
+        "Name": {"title": [{"text": {"content": _GOALS_PAGE_NAME}}]},
+    }
+    for notion_key, goal_key in _GOAL_PROPS.items():
+        if goal_key in goals:
+            properties[notion_key] = {"number": int(goals[goal_key])}
+
+    try:
+        response = await notion.databases.query(
+            database_id=config.NOTION_DAILY_DB_ID,
+            filter={"property": "Name", "title": {"equals": _GOALS_PAGE_NAME}},
+        )
+        if response["results"]:
+            await notion.pages.update(
+                page_id=response["results"][0]["id"],
+                properties=properties,
+            )
+        else:
+            await notion.pages.create(
+                parent={"database_id": config.NOTION_DAILY_DB_ID},
+                properties=properties,
+            )
+        logger.info("User goals saved to Notion: %s", goals)
+    except Exception as exc:
+        logger.warning("Could not save user goals to Notion: %s", exc)
+
+
 # ── Export data ────────────────────────────────────────────────────────────────
 
 async def get_food_entries_range(start: date, end: date) -> list[dict]:
