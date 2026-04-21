@@ -210,7 +210,15 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
     return page_url
 
 
-async def get_saved_meals(limit: int = 5) -> list[dict]:
+async def delete_saved_meal(page_id: str) -> None:
+    """Archives (soft-deletes) a saved meal template from the Saved Meals DB."""
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        return
+    await notion.pages.update(page_id=page_id, archived=True)
+    logger.info("Archived saved meal %s", page_id)
+
+
+async def get_saved_meals(limit: int = 20) -> list[dict]:
     """Returns saved meals sorted by most frequently logged."""
     if not config.NOTION_SAVED_MEALS_DB_ID:
         return await get_recent_meals(limit)

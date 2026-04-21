@@ -48,6 +48,7 @@ from notion_helper import (
     get_daily_totals_range,
     get_user_goals,
     save_user_goals,
+    delete_saved_meal,
 )
 
 
@@ -93,8 +94,9 @@ def is_authorized(user_id: int) -> bool:
     EDITING_MACROS,              # user typing updated protein/carbs/fat values
     TEMPLATE_CHOOSING_PORTION,   # templates: picking Small/Medium/Large/Custom
     TEMPLATE_ENTERING_WEIGHT,    # templates: typing custom gram weight
+    TEMPLATE_SAVING_NEW,         # templates: user typed description, awaiting AI + confirm
     SETTING_GOALS,               # /goals: user typing a new goal value
-) = range(16)
+) = range(17)
 
 
 # ── Goal metadata ──────────────────────────────────────────────────────────────
@@ -265,7 +267,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/summary   — today's macro progress\n"
         "/recent    — re-log a saved meal\n"
         "/yesterday — copy yesterday's meals\n"
-        "/templates — quick-log a saved meal template\n"
+        "/templates — manage and quick-log meal templates\n"
         "/chart     — 7-day calorie trend chart\n"
         "/goals     — view or update macro goals\n"
         "/weight    — log your body weight (e.g. /weight 85)\n"
@@ -1585,32 +1587,46 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── /templates ────────────────────────────────────────────────────────────────
 
+def _templates_keyboard(meals: list[dict]) -> InlineKeyboardMarkup:
+    """Build the templates list keyboard: [meal name] [🗑️] per row + ➕ at bottom."""
+    rows = []
+    for m in meals:
+        label = f"{m['name'][:22]}  {m['calories']:.0f}kcal"
+        if m.get("times_logged"):
+            label += f"  ×{m['times_logged']}"
+        rows.append([
+            InlineKeyboardButton(label,  callback_data=f"tpl_{m['page_id']}"),
+            InlineKeyboardButton("🗑️",   callback_data=f"del_tpl_{m['page_id']}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Save New Template", callback_data="templates_add_new")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def templates_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
 
-    msg = await update.message.reply_text("Loading your saved meals...")
+    msg = await update.message.reply_text("Loading your templates...")
     meals = await get_saved_meals()
+
     if not meals:
         await msg.edit_text(
-            "No saved templates yet.\n\n"
-            "Log a meal then tap ⭐ to save it as a template."
+            "No templates saved yet.\n\n"
+            "Log a meal and tap ⭐ to save it, or tap ➕ below to add one now.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("➕ Save New Template", callback_data="templates_add_new")
+            ]]),
         )
-        return ConversationHandler.END
+        return TEMPLATE_CHOOSING_PORTION
 
     context.bot_data.setdefault("template_meals", {}).update(
         {m["page_id"]: m for m in meals}
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{m['name'][:28]}  {m['calories']:.0f} kcal"
-            + (f"  ×{m['times_logged']}" if m.get("times_logged") else ""),
-            callback_data=f"tpl_{m['page_id']}"
-        )]
-        for m in meals
-    ])
-    await msg.edit_text("Tap a meal to log it instantly:", reply_markup=keyboard)
+    await msg.edit_text(
+        "Tap a meal to log it  ·  🗑️ to delete  ·  ➕ to add new:",
+        reply_markup=_templates_keyboard(meals),
+    )
     return TEMPLATE_CHOOSING_PORTION
 
 
@@ -1759,6 +1775,122 @@ async def template_custom_weight_handler(
     except Exception:
         logger.exception("Error logging template with custom weight")
         await status.edit_text("Something went wrong. Please try again.")
+    return ConversationHandler.END
+
+
+async def template_delete_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Delete a template then refresh the list in-place."""
+    query = update.callback_query
+    await query.answer()
+
+    page_id = query.data[len("del_tpl_"):]
+    # Optimistically remove from local cache
+    deleted_name = context.bot_data.get("template_meals", {}).pop(page_id, {}).get("name", "Meal")
+
+    try:
+        await delete_saved_meal(page_id)
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to delete template %s", page_id)
+        await query.answer("Could not delete. Try again.", show_alert=True)
+        return TEMPLATE_CHOOSING_PORTION
+
+    # Refresh list from Notion
+    meals = await get_saved_meals()
+    if not meals:
+        await query.edit_message_text(
+            f'🗑️ "{deleted_name}" deleted.\n\n'
+            "No templates left. Tap ➕ to add one.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("➕ Save New Template", callback_data="templates_add_new")
+            ]]),
+        )
+        return TEMPLATE_CHOOSING_PORTION
+
+    context.bot_data.setdefault("template_meals", {}).update(
+        {m["page_id"]: m for m in meals}
+    )
+    await query.edit_message_text(
+        f'🗑️ "{deleted_name}" deleted.\n\nTap a meal to log  ·  🗑️ to delete  ·  ➕ to add new:',
+        reply_markup=_templates_keyboard(meals),
+    )
+    return TEMPLATE_CHOOSING_PORTION
+
+
+async def template_add_new_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """User taps ➕ — ask them to describe the meal."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Describe the meal you want to save as a template.\n\n"
+        "Examples:\n"
+        "• 200g grilled chicken breast + 150g white rice\n"
+        "• Protein shake with 300ml milk and 1 banana\n"
+        "• Big Mac meal from McDonald's"
+    )
+    return TEMPLATE_SAVING_NEW
+
+
+async def template_new_description_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Receives the description, runs AI analysis, shows a save-confirmation card."""
+    description = update.message.text.strip()
+    msg = await update.message.reply_text("🤖 Analyzing with AI...")
+
+    try:
+        nutrition = await analyze_food_text(description)
+    except Exception as exc:
+        await msg.edit_text(f"AI analysis failed: {exc}\n\nUse /templates to try again.")
+        return ConversationHandler.END
+
+    context.user_data["template_new_nutrition"] = nutrition
+
+    preview = (
+        f"📌 Save as Template?\n\n"
+        f"{nutrition.food_name}\n"
+        f"Portion: {nutrition.portion_size}\n\n"
+        f"Calories:  {nutrition.calories:.0f} kcal\n"
+        f"Protein:   {nutrition.protein_g:.1f}g  |  Carbs: {nutrition.carbs_g:.1f}g  |  Fat: {nutrition.fat_g:.1f}g\n"
+        f"Fiber:     {nutrition.fiber_g:.1f}g  |  Sugar: {nutrition.sugar_g:.1f}g\n\n"
+        f"Confidence: {nutrition.confidence} (~{nutrition.confidence_pct}%)"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Save Template",  callback_data="tpl_save_confirm"),
+        InlineKeyboardButton("❌ Cancel",          callback_data="tpl_save_cancel"),
+    ]])
+    await msg.edit_text(preview, reply_markup=keyboard)
+    return TEMPLATE_SAVING_NEW
+
+
+async def template_new_confirm_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Handles ✅ Save Template / ❌ Cancel from the new-template confirmation card."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "tpl_save_cancel":
+        await query.edit_message_text("Cancelled. Use /templates to try again.")
+        return ConversationHandler.END
+
+    nutrition: NutritionData | None = context.user_data.pop("template_new_nutrition", None)
+    if not nutrition:
+        await query.edit_message_text("Session expired. Use /templates to try again.")
+        return ConversationHandler.END
+
+    try:
+        await save_to_saved_meals(nutrition)
+        await query.edit_message_text(
+            f'✅ "{nutrition.food_name}" saved to templates!\n\n'
+            f"Use /templates to log it next time."
+        )
+    except Exception as exc:
+        await query.edit_message_text(f"Failed to save: {exc}")
+
     return ConversationHandler.END
 
 
@@ -2061,7 +2193,7 @@ def main() -> None:
             BotCommand("summary",   "Today's macro progress"),
             BotCommand("recent",    "Re-log a saved meal"),
             BotCommand("yesterday", "Copy yesterday's meals"),
-            BotCommand("templates", "Quick-log a saved meal template"),
+            BotCommand("templates", "Manage and quick-log meal templates"),
             BotCommand("chart",     "7-day calorie trend chart"),
             BotCommand("goals",     "View or update macro goals"),
             BotCommand("fasting",   "Toggle fasting mode for today"),
@@ -2141,11 +2273,19 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, weight_input_handler),
             ],
             TEMPLATE_CHOOSING_PORTION: [
-                CallbackQueryHandler(template_select_callback,  pattern="^tpl_"),
-                CallbackQueryHandler(template_portion_callback, pattern="^psize_(small|medium|large|custom)$"),
+                # Confirm/cancel must be listed before the broad tpl_ pattern
+                CallbackQueryHandler(template_new_confirm_callback, pattern="^tpl_(save_confirm|save_cancel)$"),
+                CallbackQueryHandler(template_select_callback,      pattern="^tpl_"),
+                CallbackQueryHandler(template_delete_callback,      pattern="^del_tpl_"),
+                CallbackQueryHandler(template_add_new_callback,     pattern="^templates_add_new$"),
+                CallbackQueryHandler(template_portion_callback,     pattern="^psize_(small|medium|large|custom)$"),
             ],
             TEMPLATE_ENTERING_WEIGHT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, template_custom_weight_handler),
+            ],
+            TEMPLATE_SAVING_NEW: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, template_new_description_handler),
+                CallbackQueryHandler(template_new_confirm_callback, pattern="^tpl_(save_confirm|save_cancel)$"),
             ],
             SETTING_GOALS: [
                 CallbackQueryHandler(goals_edit_menu_callback, pattern="^goals_edit_menu$"),
