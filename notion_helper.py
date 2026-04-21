@@ -2,6 +2,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 from notion_client import AsyncClient
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
 from vision import NutritionData
@@ -13,6 +14,7 @@ notion = AsyncClient(auth=config.NOTION_API_KEY)
 
 # ── Daily Log ──────────────────────────────────────────────────────────────────
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 async def get_or_create_daily_log(today: date) -> str:
     date_str = today.isoformat()
     response = await notion.databases.query(
@@ -36,6 +38,7 @@ async def get_or_create_daily_log(today: date) -> str:
     return page_id
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 async def get_today_totals(today: date) -> dict:
     date_str = today.isoformat()
     response = await notion.databases.query(
@@ -81,8 +84,39 @@ async def log_water(amount_ml: int, today: date) -> int:
     return new_total
 
 
+async def set_fasting_status(today: date, fasting: bool) -> None:
+    """Write/clear the Fasting checkbox on today's Daily Log page."""
+    daily_log_id = await get_or_create_daily_log(today)
+    try:
+        await notion.pages.update(
+            page_id=daily_log_id,
+            properties={"Fasting": {"checkbox": fasting}},
+        )
+        logger.info("Fasting status set to %s for %s", fasting, today)
+    except Exception as exc:
+        logger.warning("Could not persist fasting status (property may not exist): %s", exc)
+
+
+async def get_fasting_status(today: date) -> bool:
+    """Read the Fasting checkbox from today's Daily Log page. Returns False if missing."""
+    date_str = today.isoformat()
+    try:
+        response = await notion.databases.query(
+            database_id=config.NOTION_DAILY_DB_ID,
+            filter={"property": "Name", "title": {"equals": date_str}},
+        )
+        if not response["results"]:
+            return False
+        props = response["results"][0]["properties"]
+        return bool(props.get("Fasting", {}).get("checkbox", False))
+    except Exception as exc:
+        logger.warning("Could not read fasting status: %s", exc)
+        return False
+
+
 # ── Food Entries ───────────────────────────────────────────────────────────────
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 async def create_food_entry(
     nutrition: NutritionData,
     photo_url: str,

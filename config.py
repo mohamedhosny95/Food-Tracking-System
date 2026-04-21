@@ -37,3 +37,25 @@ ALLOWED_USER_IDS: list[int] = (
     if _raw_ids.strip()
     else []
 )
+
+# Meal type hour thresholds (24-hour clock, local time)
+MEAL_BREAKFAST_START: int = 5
+MEAL_LUNCH_START: int = 11
+MEAL_SNACK_START: int = 15
+MEAL_DINNER_START: int = 18
+MEAL_DINNER_END: int = 22
+
+# Portion size adjustment factors
+PORTION_SMALL_FACTOR: float = 0.6
+PORTION_LARGE_FACTOR: float = 1.4
+
+# Custom weight input limits (grams)
+MIN_CUSTOM_WEIGHT_G: int = 10
+MAX_CUSTOM_WEIGHT_G: int = 5000
+
+# Fraction of daily calorie goal below which a "low intake" warning fires
+LOW_CALORIE_THRESHOLD: float = float(os.getenv("LOW_CALORIE_THRESHOLD", "0.6"))
+
+# Macro suggestion factors per kg of bodyweight
+KCAL_PER_KG: float = 33.0
+PROTEIN_PER_KG: float = 2.0

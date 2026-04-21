@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 import PIL.Image
 import google.generativeai as genai
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 import config
 
@@ -123,10 +124,17 @@ class NutritionData:
     confidence_pct: int = 0          # 0–100; 0 means not returned by AI
     transcription: str = ""          # only set for voice messages
     estimated_weight_g: float = 0    # AI's best guess at total weight in grams
+    source: str = ""                 # data origin: "AI (Photo)", "Open Food Facts", etc.
 
 
 # ── Streaming helper ───────────────────────────────────────────────────────────
 
+@retry(
+    retry=retry_if_exception_type(Exception),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
 async def _stream(parts: list) -> str:
     """Call Gemini with streaming and return the full concatenated text."""
     raw = ""
@@ -144,8 +152,8 @@ async def _stream(parts: list) -> str:
             except Exception:
                 pass
     except Exception as e:
-        logger.error("Gemini API call failed: %s", e)
-        raise RuntimeError(f"Gemini API error: {e}") from e
+        logger.warning("Gemini API call failed (will retry): %s", e)
+        raise
     return raw.strip()
 
 
@@ -155,7 +163,9 @@ async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
     image = PIL.Image.open(io.BytesIO(image_bytes))
     raw = await _stream([VISION_PROMPT, image])
     logger.debug("Vision response (%d chars): %s", len(raw), raw)
-    return _parse_nutrition_response(raw)
+    nutrition = _parse_nutrition_response(raw)
+    nutrition.source = "AI (Photo)"
+    return nutrition
 
 
 async def analyze_food_text(description: str, cooking_context: str = "") -> NutritionData:
@@ -166,7 +176,9 @@ async def analyze_food_text(description: str, cooking_context: str = "") -> Nutr
     suffix = f"\n\nCooking context provided by user: {cooking_context}" if cooking_context else ""
     raw = await _stream([TEXT_PROMPT + f"\n\nMeal description: {description}{suffix}"])
     logger.debug("Text response (%d chars): %s", len(raw), raw)
-    return _parse_nutrition_response(raw)
+    nutrition = _parse_nutrition_response(raw)
+    nutrition.source = "AI (Ingredients)"
+    return nutrition
 
 
 async def analyze_restaurant_meal(description: str, serving_type: str = "") -> NutritionData:
@@ -181,7 +193,9 @@ async def analyze_restaurant_meal(description: str, serving_type: str = "") -> N
         suffix = "\n\nIMPORTANT: The user confirmed this is a home-cooked portion. Use standard home portion sizes, not restaurant sizes."
     raw = await _stream([RESTAURANT_PROMPT + f"\n\nMeal: {description}{suffix}"])
     logger.debug("Restaurant response (%d chars): %s", len(raw), raw)
-    return _parse_nutrition_response(raw)
+    nutrition = _parse_nutrition_response(raw)
+    nutrition.source = "AI (Restaurant DB)"
+    return nutrition
 
 
 async def analyze_voice_message(audio_bytes: bytes) -> NutritionData:
@@ -191,6 +205,7 @@ async def analyze_voice_message(audio_bytes: bytes) -> NutritionData:
     raw = await _stream([VOICE_PROMPT, audio_part])
     logger.debug("Voice response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
+    nutrition.source = "AI (Voice)"
     return nutrition
 
 
@@ -281,6 +296,7 @@ async def lookup_barcode_product(barcode: str) -> NutritionData | None:
         confidence_pct=92,
         notes=f"Open Food Facts data. Barcode: {barcode}",
         recognizable=True,
+        source="Open Food Facts",
     )
 
 
