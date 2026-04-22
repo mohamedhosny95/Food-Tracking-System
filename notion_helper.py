@@ -165,6 +165,86 @@ async def create_food_entry(
 
 # ── Saved Meals ────────────────────────────────────────────────────────────────
 
+async def ensure_saved_meals_db() -> None:
+    """
+    Auto-provision the Saved Meals DB if NOTION_SAVED_MEALS_DB_ID is not configured.
+    Searches Notion first to avoid creating duplicates across restarts, then creates
+    one attached to NOTION_PARENT_PAGE_ID if needed. Patches config at runtime.
+    """
+    if config.NOTION_SAVED_MEALS_DB_ID:
+        return
+
+    logger.info("NOTION_SAVED_MEALS_DB_ID not set — searching Notion for existing Saved Meals DB...")
+
+    try:
+        response = await notion.search(
+            query="Saved Meals",
+            filter={"value": "database", "property": "object"},
+        )
+        for result in response.get("results", []):
+            if result.get("object") != "database":
+                continue
+            title_parts = result.get("title", [])
+            title = title_parts[0]["text"]["content"] if title_parts else ""
+            if title == "Saved Meals":
+                db_id = result["id"]
+                config.NOTION_SAVED_MEALS_DB_ID = db_id
+                logger.info(
+                    "Found existing Saved Meals DB: %s — "
+                    "add NOTION_SAVED_MEALS_DB_ID=%s to Railway env vars to skip this search on next start",
+                    db_id, db_id,
+                )
+                return
+    except Exception as exc:
+        logger.warning("Notion search for Saved Meals DB failed: %s", exc)
+
+    if not config.NOTION_PARENT_PAGE_ID:
+        logger.warning(
+            "Cannot auto-create Saved Meals DB: NOTION_PARENT_PAGE_ID is not set. "
+            "Templates will show recent meals only. "
+            "Run migrate_notion.py or set NOTION_SAVED_MEALS_DB_ID in Railway env vars."
+        )
+        return
+
+    logger.info("Creating Saved Meals DB under parent page %s...", config.NOTION_PARENT_PAGE_ID)
+    try:
+        saved_meals_db = await notion.databases.create(
+            parent={"type": "page_id", "page_id": config.NOTION_PARENT_PAGE_ID},
+            title=[{"type": "text", "text": {"content": "Saved Meals"}}],
+            properties={
+                "Name":         {"title": {}},
+                "Calories":     {"number": {"format": "number"}},
+                "Protein":      {"number": {"format": "number"}},
+                "Carbs":        {"number": {"format": "number"}},
+                "Fat":          {"number": {"format": "number"}},
+                "Fiber":        {"number": {"format": "number"}},
+                "Sugar":        {"number": {"format": "number"}},
+                "Sodium":       {"number": {"format": "number"}},
+                "Portion Size": {"rich_text": {}},
+                "Times Logged": {"number": {"format": "number"}},
+                "Meal Type": {
+                    "select": {
+                        "options": [
+                            {"name": "Breakfast", "color": "yellow"},
+                            {"name": "Lunch",     "color": "green"},
+                            {"name": "Dinner",    "color": "blue"},
+                            {"name": "Snack",     "color": "orange"},
+                        ]
+                    }
+                },
+            },
+        )
+        db_id = saved_meals_db["id"]
+        config.NOTION_SAVED_MEALS_DB_ID = db_id
+        logger.info(
+            "Created Saved Meals DB: %s\n"
+            "==> ACTION REQUIRED: Add to Railway env vars: NOTION_SAVED_MEALS_DB_ID=%s",
+            db_id, db_id,
+        )
+    except Exception as exc:
+        logger.error("Failed to create Saved Meals DB: %s", exc)
+
+
 async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> str:
     """Saves a meal to the Saved Meals DB. Returns the page URL."""
     if not config.NOTION_SAVED_MEALS_DB_ID:
