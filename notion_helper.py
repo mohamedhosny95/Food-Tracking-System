@@ -170,21 +170,50 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
     if not config.NOTION_SAVED_MEALS_DB_ID:
         return ""
 
-    # Check if a meal with this name already exists — if so, increment count
+    # Check if a meal with this name already exists (including archived ones)
     response = await notion.databases.query(
         database_id=config.NOTION_SAVED_MEALS_DB_ID,
         filter={"property": "Name", "title": {"equals": nutrition.food_name[:100]}},
     )
-    if response["results"]:
-        page_id = response["results"][0]["id"]
-        props = response["results"][0]["properties"]
+    active_page = next(
+        (p for p in response["results"] if not p.get("archived") and not p.get("in_trash")),
+        None,
+    )
+    if active_page:
+        page_id = active_page["id"]
+        props = active_page["properties"]
         times = int(props.get("Times Logged", {}).get("number") or 1) + 1
         await notion.pages.update(
             page_id=page_id,
             properties={"Times Logged": {"number": times}},
         )
         logger.info("Incremented saved meal '%s' to %d times", nutrition.food_name, times)
-        return response["results"][0].get("url", "")
+        return active_page.get("url", "")
+
+    # Re-use an archived page with the same name rather than leaving it orphaned
+    archived_page = next(
+        (p for p in response["results"] if p.get("archived") or p.get("in_trash")),
+        None,
+    )
+    if archived_page:
+        page_id = archived_page["id"]
+        await notion.pages.update(
+            page_id=page_id,
+            archived=False,
+            properties={
+                "Calories":     {"number": round(nutrition.calories, 1)},
+                "Protein":      {"number": round(nutrition.protein_g, 1)},
+                "Carbs":        {"number": round(nutrition.carbs_g, 1)},
+                "Fat":          {"number": round(nutrition.fat_g, 1)},
+                "Fiber":        {"number": round(nutrition.fiber_g, 1)},
+                "Sugar":        {"number": round(nutrition.sugar_g, 1)},
+                "Sodium":       {"number": int(nutrition.sodium_mg)},
+                "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
+                "Times Logged": {"number": 1},
+            },
+        )
+        logger.info("Restored archived saved meal '%s'", nutrition.food_name)
+        return archived_page.get("url", "")
 
     properties: dict = {
         "Name":         {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
@@ -210,6 +239,7 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
     return page_url
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
 async def delete_saved_meal(page_id: str) -> None:
     """Archives (soft-deletes) a saved meal template from the Saved Meals DB."""
     if not config.NOTION_SAVED_MEALS_DB_ID:
@@ -231,6 +261,8 @@ async def get_saved_meals(limit: int = 20) -> list[dict]:
 
     meals = []
     for page in response["results"]:
+        if page.get("archived", False) or page.get("in_trash", False):
+            continue
         props = page["properties"]
         titles = props.get("Name", {}).get("title", [])
         name = titles[0]["text"]["content"] if titles else "Unknown"

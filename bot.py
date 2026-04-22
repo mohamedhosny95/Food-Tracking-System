@@ -1626,9 +1626,7 @@ async def templates_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return TEMPLATE_CHOOSING_PORTION
 
-    context.bot_data.setdefault("template_meals", {}).update(
-        {m["page_id"]: m for m in meals}
-    )
+    context.bot_data["template_meals"] = {m["page_id"]: m for m in meals}
     await msg.edit_text(
         "Tap a meal to log it  ·  🗑️ to delete  ·  ➕ to add new:",
         reply_markup=_templates_keyboard(meals),
