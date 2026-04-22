@@ -1,0 +1,37 @@
+name: Run Bot
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'   # restart every 5 hours (GitHub jobs max out at 6h)
+  workflow_dispatch:          # also allows manual "Run workflow" button
+
+concurrency:
+  group: bot-runner
+  cancel-in-progress: true   # cancel the old job the moment a new one starts
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350      # 5h50m — safely under GitHub's 6h hard limit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start bot
+        run: python bot.py
+        env:
+          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
+          NOTION_API_KEY:          ${{ secrets.NOTION_API_KEY }}
+          NOTION_FOOD_DB_ID:       ${{ secrets.NOTION_FOOD_DB_ID }}
+          NOTION_DAILY_DB_ID:      ${{ secrets.NOTION_DAILY_DB_ID }}
+          NOTION_PARENT_PAGE_ID:   ${{ secrets.NOTION_PARENT_PAGE_ID }}
+          NOTION_SAVED_MEALS_DB_ID: ${{ secrets.NOTION_SAVED_MEALS_DB_ID }}
+          TIMEZONE_HOURS:          "3"

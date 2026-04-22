@@ -2389,13 +2389,13 @@ def main() -> None:
             url_path=config.TELEGRAM_BOT_TOKEN,
             webhook_url=webhook_url,
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
+            drop_pending_updates=False,
         )
     else:
-        # Polling mode — start health server so Render sees an open port
+        # Polling mode — start health server so Render/Koyeb sees an open port
         _start_health_server(port)
         logger.info("Bot starting in polling mode (health server on port %d).", port)
-        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":
