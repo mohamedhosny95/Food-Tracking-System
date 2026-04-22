@@ -14,6 +14,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
+    PicklePersistence,
     filters,
     ContextTypes,
 )
@@ -49,6 +50,7 @@ from notion_helper import (
     get_user_goals,
     save_user_goals,
     delete_saved_meal,
+    init_saved_meals,
 )
 
 
@@ -1230,9 +1232,7 @@ async def recent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.edit_text("No saved meals yet. Log meals and tap ⭐ to save them.")
         return
 
-    context.bot_data.setdefault("recent_meals", {}).update(
-        {m["page_id"]: m for m in meals}
-    )
+    context.bot_data["recent_meals"] = {m["page_id"]: m for m in meals}
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"{m['name'][:26]} ({m['calories']:.0f} kcal)"
@@ -2228,6 +2228,7 @@ def main() -> None:
             BotCommand("fasting",   "Toggle fasting mode for today"),
             BotCommand("export",    "Export your food log as CSV"),
         ])
+        await init_saved_meals()
         await _maybe_create_weekly_review(application)
         await _ensure_weight_property()
         await _load_fasting_from_notion(application.bot_data)
@@ -2239,7 +2240,13 @@ def main() -> None:
         except Exception:
             pass  # Fall back to config defaults
 
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .persistence(PicklePersistence("bot_state.pkl"))
+        .post_init(post_init)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
