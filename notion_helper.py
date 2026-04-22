@@ -172,8 +172,33 @@ async def create_food_entry(
 # All reads go to SQLite (fast, no API rate limits, survives bot restarts).
 
 async def get_saved_meals(limit: int = 0) -> list[dict]:
-    """Return saved meals from the local SQLite DB, sorted by times_logged."""
-    return await _db.get_meals(limit)
+    """
+    Return saved meals from SQLite.
+
+    Fallback logic when SQLite is empty:
+    - Notion DB configured → attempt a lazy import from Notion right now
+      (handles the case where the startup import failed or was skipped).
+    - Notion DB not configured → fall back to recent food log entries so the
+      user always sees something useful (mirrors the old behaviour).
+    """
+    meals = await _db.get_meals(limit)
+    if meals:
+        return meals
+
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        return await get_recent_meals(20)
+
+    # SQLite empty but Notion is configured — try a lazy import
+    try:
+        notion_meals = await _fetch_all_from_notion()
+        if notion_meals:
+            await _db.import_from_notion(notion_meals)
+            logger.info("Lazy import: fetched %d meals from Notion", len(notion_meals))
+            return await _db.get_meals(limit)
+    except Exception:
+        logger.exception("Lazy Notion import failed in get_saved_meals")
+
+    return []
 
 
 async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> str:

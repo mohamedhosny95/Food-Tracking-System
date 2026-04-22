@@ -14,7 +14,6 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
-    PicklePersistence,
     filters,
     ContextTypes,
 )
@@ -2240,13 +2239,7 @@ def main() -> None:
         except Exception:
             pass  # Fall back to config defaults
 
-    app = (
-        Application.builder()
-        .token(config.TELEGRAM_BOT_TOKEN)
-        .persistence(PicklePersistence("bot_state.pkl"))
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[
