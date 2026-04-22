@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import date, datetime, timedelta
 
@@ -6,7 +5,6 @@ from notion_client import AsyncClient
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
-import db as _db
 from vision import NutritionData
 
 logger = logging.getLogger(__name__)
@@ -166,88 +164,58 @@ async def create_food_entry(
 
 
 # ── Saved Meals ────────────────────────────────────────────────────────────────
-#
-# SQLite is the source of truth.  Notion is written to in the background so
-# the user can still browse templates in their Notion workspace.
-# All reads go to SQLite (fast, no API rate limits, survives bot restarts).
-
-async def get_saved_meals(limit: int = 0) -> list[dict]:
-    """
-    Return saved meals from SQLite.
-
-    Fallback logic when SQLite is empty:
-    - Notion DB configured → attempt a lazy import from Notion right now
-      (handles the case where the startup import failed or was skipped).
-    - Notion DB not configured → fall back to recent food log entries so the
-      user always sees something useful (mirrors the old behaviour).
-    """
-    meals = await _db.get_meals(limit)
-    if meals:
-        return meals
-
-    if not config.NOTION_SAVED_MEALS_DB_ID:
-        return await get_recent_meals(20)
-
-    # SQLite empty but Notion is configured — try a lazy import
-    try:
-        notion_meals = await _fetch_all_from_notion()
-        if notion_meals:
-            await _db.import_from_notion(notion_meals)
-            logger.info("Lazy import: fetched %d meals from Notion", len(notion_meals))
-            return await _db.get_meals(limit)
-    except Exception:
-        logger.exception("Lazy Notion import failed in get_saved_meals")
-
-    return []
-
 
 async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> str:
-    """
-    Write to SQLite immediately and fire a background task to sync Notion.
+    """Saves a meal to the Saved Meals DB. Returns the page URL."""
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        return ""
 
-    Returns "" — callers do not use the URL so we avoid blocking on Notion.
-    """
-    local_id, is_new = await _db.save_meal(
-        name=nutrition.food_name[:100],
-        calories=nutrition.calories,
-        protein_g=nutrition.protein_g,
-        carbs_g=nutrition.carbs_g,
-        fat_g=nutrition.fat_g,
-        fiber_g=nutrition.fiber_g,
-        sugar_g=nutrition.sugar_g,
-        sodium_mg=nutrition.sodium_mg,
-        portion_size=nutrition.portion_size,
+    # Check if a meal with this name already exists (including archived ones)
+    response = await notion.databases.query(
+        database_id=config.NOTION_SAVED_MEALS_DB_ID,
+        filter={"property": "Name", "title": {"equals": nutrition.food_name[:100]}},
     )
-    if config.NOTION_SAVED_MEALS_DB_ID:
-        if is_new:
-            asyncio.create_task(
-                _notion_sync_new(local_id, nutrition, meal_type),
-                name=f"notion_sync_new_{local_id}",
-            )
-        else:
-            asyncio.create_task(
-                _notion_sync_increment(local_id),
-                name=f"notion_sync_inc_{local_id}",
-            )
-    return ""
-
-
-async def delete_saved_meal(local_id: str) -> None:
-    """
-    Delete from SQLite immediately and fire a background task to archive in Notion.
-    """
-    notion_page_id = await _db.delete_meal(local_id)
-    if notion_page_id and config.NOTION_SAVED_MEALS_DB_ID:
-        asyncio.create_task(
-            _notion_sync_delete(notion_page_id),
-            name=f"notion_sync_del_{notion_page_id}",
+    active_page = next(
+        (p for p in response["results"] if not p.get("archived") and not p.get("in_trash")),
+        None,
+    )
+    if active_page:
+        page_id = active_page["id"]
+        props = active_page["properties"]
+        times = int(props.get("Times Logged", {}).get("number") or 1) + 1
+        await notion.pages.update(
+            page_id=page_id,
+            properties={"Times Logged": {"number": times}},
         )
+        logger.info("Incremented saved meal '%s' to %d times", nutrition.food_name, times)
+        return active_page.get("url", "")
 
+    # Re-use an archived page with the same name rather than leaving it orphaned
+    archived_page = next(
+        (p for p in response["results"] if p.get("archived") or p.get("in_trash")),
+        None,
+    )
+    if archived_page:
+        page_id = archived_page["id"]
+        await notion.pages.update(
+            page_id=page_id,
+            archived=False,
+            properties={
+                "Calories":     {"number": round(nutrition.calories, 1)},
+                "Protein":      {"number": round(nutrition.protein_g, 1)},
+                "Carbs":        {"number": round(nutrition.carbs_g, 1)},
+                "Fat":          {"number": round(nutrition.fat_g, 1)},
+                "Fiber":        {"number": round(nutrition.fiber_g, 1)},
+                "Sugar":        {"number": round(nutrition.sugar_g, 1)},
+                "Sodium":       {"number": int(nutrition.sodium_mg)},
+                "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
+                "Times Logged": {"number": 1},
+            },
+        )
+        logger.info("Restored archived saved meal '%s'", nutrition.food_name)
+        return archived_page.get("url", "")
 
-# ── Notion background sync helpers ─────────────────────────────────────────────
-
-def _meal_properties(nutrition: NutritionData, meal_type: str, times: int = 1) -> dict:
-    props: dict = {
+    properties: dict = {
         "Name":         {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
         "Calories":     {"number": round(nutrition.calories, 1)},
         "Protein":      {"number": round(nutrition.protein_g, 1)},
@@ -257,125 +225,72 @@ def _meal_properties(nutrition: NutritionData, meal_type: str, times: int = 1) -
         "Sugar":        {"number": round(nutrition.sugar_g, 1)},
         "Sodium":       {"number": int(nutrition.sodium_mg)},
         "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
-        "Times Logged": {"number": times},
+        "Times Logged": {"number": 1},
     }
     if meal_type:
-        props["Meal Type"] = {"select": {"name": meal_type}}
-    return props
+        properties["Meal Type"] = {"select": {"name": meal_type}}
+
+    new_page = await notion.pages.create(
+        parent={"database_id": config.NOTION_SAVED_MEALS_DB_ID},
+        properties=properties,
+    )
+    page_url = new_page.get("url", "")
+    logger.info("Saved meal '%s' to Saved Meals DB", nutrition.food_name)
+    return page_url
 
 
-async def _notion_sync_new(local_id: str, nutrition: NutritionData, meal_type: str) -> None:
-    """Create a new page in Notion and store the Notion page_id in SQLite."""
-    try:
-        new_page = await notion.pages.create(
-            parent={"database_id": config.NOTION_SAVED_MEALS_DB_ID},
-            properties=_meal_properties(nutrition, meal_type),
-        )
-        await _db.set_notion_page_id(local_id, new_page["id"])
-        logger.info("Notion sync: created page for '%s'", nutrition.food_name)
-    except Exception:
-        logger.exception("Notion sync (new) failed for local_id=%s", local_id)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+async def delete_saved_meal(page_id: str) -> None:
+    """Archives (soft-deletes) a saved meal template from the Saved Meals DB."""
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        return
+    await notion.pages.update(page_id=page_id, archived=True)
+    logger.info("Archived saved meal %s", page_id)
 
 
-async def _notion_sync_increment(local_id: str) -> None:
-    """Update Times Logged in Notion to match the current SQLite value."""
-    try:
-        meal = await _db.get_meal_by_id(local_id)
-        if not meal or not meal.get("notion_page_id"):
-            return
-        await notion.pages.update(
-            page_id=meal["notion_page_id"],
-            properties={"Times Logged": {"number": meal["times_logged"]}},
-        )
-        logger.info("Notion sync: incremented Times Logged for '%s'", meal["name"])
-    except Exception:
-        logger.exception("Notion sync (increment) failed for local_id=%s", local_id)
+async def get_saved_meals(limit: int = 20) -> list[dict]:
+    """Returns saved meals sorted by most frequently logged."""
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        return await get_recent_meals(limit)
 
+    response = await notion.databases.query(
+        database_id=config.NOTION_SAVED_MEALS_DB_ID,
+        sorts=[{"property": "Times Logged", "direction": "descending"}],
+        page_size=limit,
+    )
 
-async def _notion_sync_delete(notion_page_id: str) -> None:
-    """Archive the Notion page for a deleted template."""
-    try:
-        await notion.pages.update(page_id=notion_page_id, archived=True)
-        logger.info("Notion sync: archived page %s", notion_page_id)
-    except Exception:
-        logger.exception("Notion sync (delete) failed for page_id=%s", notion_page_id)
+    meals = []
+    for page in response["results"]:
+        if page.get("archived", False) or page.get("in_trash", False):
+            continue
+        props = page["properties"]
+        titles = props.get("Name", {}).get("title", [])
+        name = titles[0]["text"]["content"] if titles else "Unknown"
 
+        def _num(key: str) -> float:
+            return float(props.get(key, {}).get("number") or 0)
+        def _text(key: str) -> str:
+            blocks = props.get(key, {}).get("rich_text", [])
+            return blocks[0]["text"]["content"] if blocks else ""
 
-# ── Startup: seed SQLite from Notion (first run only) ─────────────────────────
-
-async def _fetch_all_from_notion() -> list[dict]:
-    """Fetch every non-archived saved meal from Notion, handling pagination."""
-    meals: list[dict] = []
-    has_more = True
-    start_cursor: str | None = None
-
-    while has_more:
-        kwargs: dict = {
-            "database_id": config.NOTION_SAVED_MEALS_DB_ID,
-            "sorts": [{"property": "Times Logged", "direction": "descending"}],
-            "page_size": 100,
-        }
-        if start_cursor:
-            kwargs["start_cursor"] = start_cursor
-
-        response = await notion.databases.query(**kwargs)
-
-        for page in response["results"]:
-            if page.get("archived", False) or page.get("in_trash", False):
-                continue
-            props = page["properties"]
-            titles = props.get("Name", {}).get("title", [])
-            name = titles[0]["text"]["content"] if titles else "Unknown"
-
-            def _num(key: str, p: dict = props) -> float:
-                return float(p.get(key, {}).get("number") or 0)
-            def _text(key: str, p: dict = props) -> str:
-                blocks = p.get(key, {}).get("rich_text", [])
-                return blocks[0]["text"]["content"] if blocks else ""
-
-            meals.append({
-                "page_id":      page["id"],
-                "name":         name,
-                "calories":     _num("Calories"),
-                "protein_g":    _num("Protein"),
-                "carbs_g":      _num("Carbs"),
-                "fat_g":        _num("Fat"),
-                "fiber_g":      _num("Fiber"),
-                "sugar_g":      _num("Sugar"),
-                "sodium_mg":    _num("Sodium"),
-                "portion_size": _text("Portion Size"),
-                "times_logged": int(_num("Times Logged")),
-            })
-
-        has_more = response.get("has_more", False)
-        start_cursor = response.get("next_cursor")
+        meals.append({
+            "page_id":    page["id"],
+            "name":       name,
+            "calories":   _num("Calories"),
+            "protein_g":  _num("Protein"),
+            "carbs_g":    _num("Carbs"),
+            "fat_g":      _num("Fat"),
+            "fiber_g":    _num("Fiber"),
+            "sugar_g":    _num("Sugar"),
+            "sodium_mg":  _num("Sodium"),
+            "portion_size": _text("Portion Size"),
+            "notes":      "",
+            "confidence": "High",
+            "confidence_pct": 90,
+            "times_logged": int(_num("Times Logged")),
+        })
 
     return meals
-
-
-async def init_saved_meals() -> None:
-    """
-    Initialise the SQLite DB and, on first run, seed it from Notion.
-
-    Call this once from post_init before any template handlers run.
-    """
-    await _db.init_db()
-
-    if not config.NOTION_SAVED_MEALS_DB_ID:
-        logger.warning(
-            "NOTION_SAVED_MEALS_DB_ID is not set — saved meal templates will be "
-            "stored in SQLite only and will not appear in your Notion workspace."
-        )
-        return
-
-    if await _db.is_empty():
-        logger.info("First run: importing saved meals from Notion into SQLite…")
-        try:
-            notion_meals = await _fetch_all_from_notion()
-            inserted = await _db.import_from_notion(notion_meals)
-            logger.info("Imported %d meals from Notion (fetched %d total)", inserted, len(notion_meals))
-        except Exception:
-            logger.exception("Failed to import saved meals from Notion on startup")
 
 
 async def get_recent_meals(limit: int = 5) -> list[dict]:

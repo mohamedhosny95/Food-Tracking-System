@@ -49,7 +49,6 @@ from notion_helper import (
     get_user_goals,
     save_user_goals,
     delete_saved_meal,
-    init_saved_meals,
 )
 
 
@@ -2227,7 +2226,6 @@ def main() -> None:
             BotCommand("fasting",   "Toggle fasting mode for today"),
             BotCommand("export",    "Export your food log as CSV"),
         ])
-        await init_saved_meals()
         await _maybe_create_weekly_review(application)
         await _ensure_weight_property()
         await _load_fasting_from_notion(application.bot_data)
