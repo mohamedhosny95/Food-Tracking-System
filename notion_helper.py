@@ -159,7 +159,136 @@ async def create_food_entry(
         properties=properties,
     )
     page_url: str = new_page.get("url", "")
+    page_id: str = new_page.get("id", "")
     logger.info("Created Food Entry page: %s", page_url)
+    return page_url, page_id
+
+
+async def archive_food_entry(page_id: str) -> None:
+    """Soft-deletes a food entry by archiving the Notion page."""
+    await notion.pages.update(page_id=page_id, archived=True)
+    logger.info("Archived food entry %s", page_id)
+
+
+async def get_week_calorie_bank() -> dict:
+    """Returns calories consumed vs expected for the current Mon–today window."""
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    days_elapsed = today.weekday() + 1
+
+    response = await notion.databases.query(
+        database_id=config.NOTION_DAILY_DB_ID,
+        filter={
+            "and": [
+                {"property": "Date", "date": {"on_or_after":  week_start.isoformat()}},
+                {"property": "Date", "date": {"on_or_before": today.isoformat()}},
+            ]
+        },
+        page_size=7,
+    )
+
+    def _rollup(props: dict, name: str) -> float:
+        prop = props.get(name, {})
+        if prop.get("type") == "rollup":
+            return float(prop.get("rollup", {}).get("number") or 0)
+        return float(prop.get("number") or 0)
+
+    total_cal = sum(_rollup(p["properties"], "Total Calories") for p in response["results"])
+    expected = config.DAILY_CALORIES_GOAL * days_elapsed
+    return {
+        "days_elapsed": days_elapsed,
+        "total_calories": round(total_cal),
+        "expected_calories": round(expected),
+        "bank": round(total_cal - expected),
+    }
+
+
+async def get_last_month_data() -> dict:
+    """Returns daily averages and totals for the previous calendar month."""
+    today = date.today()
+    first_this_month = today.replace(day=1)
+    last_month_end = first_this_month - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+
+    response = await notion.databases.query(
+        database_id=config.NOTION_FOOD_DB_ID,
+        filter={
+            "and": [
+                {"property": "Date", "date": {"on_or_after":  last_month_start.isoformat()}},
+                {"property": "Date", "date": {"on_or_before": last_month_end.isoformat()}},
+            ]
+        },
+        page_size=400,
+    )
+
+    totals: dict[str, float] = {
+        "calories": 0, "protein_g": 0, "carbs_g": 0,
+        "fat_g": 0, "fiber_g": 0, "entries": 0,
+    }
+    days_with_data: set[str] = set()
+    for page in response["results"]:
+        props = page["properties"]
+        def _n(k: str) -> float:
+            return float(props.get(k, {}).get("number") or 0)
+        totals["calories"]  += _n("Calories")
+        totals["protein_g"] += _n("Protein")
+        totals["carbs_g"]   += _n("Carbs")
+        totals["fat_g"]     += _n("Fat")
+        totals["fiber_g"]   += _n("Fiber")
+        totals["entries"]   += 1
+        date_prop = props.get("Date", {}).get("date", {})
+        if date_prop and date_prop.get("start"):
+            days_with_data.add(date_prop["start"])
+
+    days_in_month = (last_month_end - last_month_start).days + 1
+    days = max(len(days_with_data), 1)
+    return {
+        "start": last_month_start.isoformat(),
+        "end": last_month_end.isoformat(),
+        "month_name": last_month_end.strftime("%B %Y"),
+        "days_tracked": len(days_with_data),
+        "days_in_month": days_in_month,
+        "total_entries": int(totals["entries"]),
+        "avg_calories":  round(totals["calories"] / days, 0),
+        "avg_protein_g": round(totals["protein_g"] / days, 1),
+        "avg_carbs_g":   round(totals["carbs_g"] / days, 1),
+        "avg_fat_g":     round(totals["fat_g"] / days, 1),
+        "avg_fiber_g":   round(totals["fiber_g"] / days, 1),
+    }
+
+
+async def create_monthly_review_page(month_data: dict) -> str:
+    """Creates a monthly review Notion page under the parent page."""
+    if not config.NOTION_PARENT_PAGE_ID or not month_data.get("start"):
+        return ""
+
+    title = f"Monthly Review — {month_data['month_name']}"
+    body_lines = [
+        f"**Period:** {month_data['start']} to {month_data['end']}",
+        f"**Days tracked:** {month_data['days_tracked']} / {month_data['days_in_month']}",
+        f"**Total entries logged:** {month_data['total_entries']}",
+        "",
+        "**Daily Averages**",
+        f"Calories:  {month_data['avg_calories']:.0f} kcal",
+        f"Protein:   {month_data['avg_protein_g']:.1f} g",
+        f"Carbs:     {month_data['avg_carbs_g']:.1f} g",
+        f"Fat:       {month_data['avg_fat_g']:.1f} g",
+        f"Fiber:     {month_data['avg_fiber_g']:.1f} g",
+    ]
+
+    new_page = await notion.pages.create(
+        parent={"page_id": config.NOTION_PARENT_PAGE_ID},
+        properties={"title": [{"text": {"content": title}}]},
+        children=[{
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": "\n".join(body_lines)}}]
+            },
+        }],
+    )
+    page_url = new_page.get("url", "")
+    logger.info("Created monthly review page: %s", page_url)
     return page_url
 
 
