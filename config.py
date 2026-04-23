@@ -9,7 +9,7 @@ TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 # Google Gemini — free tier: 1,500 requests/day, 15 requests/minute
 # Get key at: aistudio.google.com/app/apikey
 GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Notion — get key at: notion.so/my-integrations
 NOTION_API_KEY: str = os.environ["NOTION_API_KEY"]

@@ -24,14 +24,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore bot state
+        uses: actions/cache/restore@v4
+        with:
+          path: bot_state.pkl
+          key: bot-state-never-match
+          restore-keys: bot-state-
+
       - name: Start bot
         run: python bot.py
         env:
-          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GEMINI_API_KEY:          ${{ secrets.GEMINI_API_KEY }}
-          NOTION_API_KEY:          ${{ secrets.NOTION_API_KEY }}
-          NOTION_FOOD_DB_ID:       ${{ secrets.NOTION_FOOD_DB_ID }}
-          NOTION_DAILY_DB_ID:      ${{ secrets.NOTION_DAILY_DB_ID }}
-          NOTION_PARENT_PAGE_ID:   ${{ secrets.NOTION_PARENT_PAGE_ID }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY:           ${{ secrets.GEMINI_API_KEY }}
+          NOTION_API_KEY:           ${{ secrets.NOTION_API_KEY }}
+          NOTION_FOOD_DB_ID:        ${{ secrets.NOTION_FOOD_DB_ID }}
+          NOTION_DAILY_DB_ID:       ${{ secrets.NOTION_DAILY_DB_ID }}
+          NOTION_PARENT_PAGE_ID:    ${{ secrets.NOTION_PARENT_PAGE_ID }}
           NOTION_SAVED_MEALS_DB_ID: ${{ secrets.NOTION_SAVED_MEALS_DB_ID }}
-          TIMEZONE_HOURS:          "3"
+          TIMEZONE_HOURS:           "3"
+
+      - name: Save bot state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bot_state.pkl
+          key: bot-state-${{ github.run_id }}

@@ -14,6 +14,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
+    PicklePersistence,
     filters,
     ContextTypes,
 )
@@ -50,6 +51,7 @@ from notion_helper import (
     save_user_goals,
     delete_saved_meal,
     ensure_saved_meals_db,
+    get_streak,
 )
 
 
@@ -182,7 +184,7 @@ async def _load_fasting_from_notion(bot_data: dict) -> bool:
     return is_fasting
 
 
-def _build_daily_summary(totals: dict, fasting: bool = False, bot_data: dict | None = None) -> str:
+def _build_daily_summary(totals: dict, fasting: bool = False, bot_data: dict | None = None, streak: int = 0) -> str:
     bd = bot_data or {}
 
     def row(label: str, val: float, goal: int, unit: str) -> str:
@@ -193,7 +195,8 @@ def _build_daily_summary(totals: dict, fasting: bool = False, bot_data: dict | N
 
     cal      = totals.get("calories", 0)
     cal_goal = _get_goal(bd, "calories")
-    header   = "Today's Progress  🌙 Fasting Day" if fasting else "Today's Progress"
+    streak_tag = f"  🔥 {streak} day streak" if streak > 1 else ""
+    header   = f"Today's Progress{streak_tag}  🌙 Fasting Day" if fasting else f"Today's Progress{streak_tag}"
 
     # Incomplete day warning: after 8pm local, if <threshold% of calorie goal and not fasting
     local_hour = (datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_HOURS)).hour
@@ -1182,11 +1185,14 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     msg = await update.message.reply_text("Fetching today's totals...")
     fasting = _is_fasting(context.bot_data)
-    totals = await get_today_totals(date.today())
+    totals, streak = await asyncio.gather(
+        get_today_totals(date.today()),
+        get_streak(),
+    )
     if not totals and not fasting:
         await msg.edit_text("No meals logged today yet. Use /log to add your first meal.")
         return
-    await msg.edit_text(_build_daily_summary(totals or {}, fasting=fasting, bot_data=context.bot_data))
+    await msg.edit_text(_build_daily_summary(totals or {}, fasting=fasting, bot_data=context.bot_data, streak=streak))
 
 
 # ── /water ────────────────────────────────────────────────────────────────────
@@ -1497,6 +1503,22 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ── Scheduled job callbacks ────────────────────────────────────────────────────
+
+async def nudge_morning(context) -> None:
+    """Sent at 9am local time if nothing logged yet and not fasting."""
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id or _is_fasting(context.bot_data):
+        return
+    totals = await get_today_totals(date.today())
+    if totals and totals.get("calories", 0) > 50:
+        return
+    streak = await get_streak()
+    streak_line = f" You're on a {streak} day streak — keep it going!" if streak > 1 else ""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Good morning! Don't forget to log your breakfast when you eat.{streak_line} Use /log when ready.",
+    )
+
 
 async def nudge_lunch(context) -> None:
     """Sent at 2pm local time if no meals logged today and not fasting."""
@@ -2239,7 +2261,14 @@ def main() -> None:
         except Exception:
             pass  # Fall back to config defaults
 
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    persistence = PicklePersistence(filepath="bot_state.pkl")
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .persistence(persistence)
+        .post_init(post_init)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -2325,6 +2354,8 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_handler)],
         per_message=False,
         allow_reentry=True,
+        name="food_conv",
+        persistent=True,
     )
 
     app.add_handler(conv_handler)
@@ -2369,6 +2400,7 @@ def main() -> None:
         return _dt.time(utc_hour, minute, tzinfo=_dt.timezone.utc)
 
     jq = app.job_queue
+    jq.run_daily(nudge_morning,          time=_local_to_utc(9,  0))   # 9:00am local
     jq.run_daily(nudge_lunch,            time=_local_to_utc(14, 0))   # 2:00pm local
     jq.run_daily(check_incomplete_day,   time=_local_to_utc(20, 0))   # 8:00pm local
     jq.run_monthly(monthly_weighin_reminder,                           # 1st of month 9am
