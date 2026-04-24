@@ -124,7 +124,7 @@ async def create_food_entry(
     today: date,
     meal_type: str = "",
     log_method: str = "",
-) -> str:
+) -> tuple[str, str]:
     date_str = today.isoformat()
 
     properties: dict = {

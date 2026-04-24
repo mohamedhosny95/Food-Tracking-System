@@ -38,7 +38,6 @@ from notion_helper import (
     log_water,
     log_weight,
     get_recent_weights,
-    search_restaurants,
     add_restaurant,
     get_last_week_data,
     create_weekly_review_page,
@@ -1409,7 +1408,7 @@ async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         today = date.today()
         daily_log_id = await get_or_create_daily_log(today)
-        page_url = await create_food_entry(
+        page_url, _ = await create_food_entry(
             nutrition, "", daily_log_id, today,
             meal_type=meal_type, log_method="Re-log",
         )
