@@ -480,7 +480,7 @@ async def get_saved_meals(limit: int = 20) -> list[dict]:
             return float(props.get(key, {}).get("number") or 0)
         def _text(key: str) -> str:
             blocks = props.get(key, {}).get("rich_text", [])
-            return blocks[0]["text"]["content"] if blocks else ""
+            return (blocks[0].get("text") or {}).get("content", "") if blocks else ""
 
         meals.append({
             "page_id":    page["id"],
@@ -556,7 +556,7 @@ async def get_recent_meals(limit: int = 5) -> list[dict]:
             return float(props.get(key, {}).get("number") or 0)
         def _text(key: str) -> str:
             blocks = props.get(key, {}).get("rich_text", [])
-            return blocks[0]["text"]["content"] if blocks else ""
+            return (blocks[0].get("text") or {}).get("content", "") if blocks else ""
 
         meals.append({
             "page_id":    page["id"],
@@ -919,43 +919,53 @@ async def save_user_goals(goals: dict) -> None:
 
 async def get_food_entries_range(start: date, end: date) -> list[dict]:
     """Returns all Food Entries between start and end dates (inclusive)."""
-    response = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
-        filter={
-            "and": [
-                {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
-                {"property": "Date", "date": {"on_or_before": end.isoformat()}},
-            ]
-        },
-        sorts=[{"property": "Date", "direction": "ascending"}],
-        page_size=100,
-    )
+    query_filter = {
+        "and": [
+            {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
+            {"property": "Date", "date": {"on_or_before": end.isoformat()}},
+        ]
+    }
+    query_sorts = [{"property": "Date", "direction": "ascending"}]
 
     rows = []
-    for page in response["results"]:
-        props = page["properties"]
-        titles = props.get("Name", {}).get("title", [])
-        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
-        date_val = (props.get("Date", {}).get("date") or {}).get("start", "")
-        rows.append({
-            "date":      date_val,
-            "meal_type": (props.get("Meal Type",  {}).get("select") or {}).get("name", ""),
-            "log_method":(props.get("Log Method", {}).get("select") or {}).get("name", ""),
-            "name":      name,
-            "calories":  props.get("Calories",  {}).get("number") or 0,
-            "protein_g": props.get("Protein",   {}).get("number") or 0,
-            "carbs_g":   props.get("Carbs",     {}).get("number") or 0,
-            "fat_g":     props.get("Fat",       {}).get("number") or 0,
-            "fiber_g":   props.get("Fiber",     {}).get("number") or 0,
-            "sugar_g":   props.get("Sugar",     {}).get("number") or 0,
-            "sodium_mg": props.get("Sodium",    {}).get("number") or 0,
-            "portion_size": (
-                (props.get("Portion Size", {}).get("rich_text") or [{}])[0]
-                .get("text", {}).get("content", "")
-            ),
-            "notes": (
-                (props.get("Notes", {}).get("rich_text") or [{}])[0]
-                .get("text", {}).get("content", "")
-            ),
-        })
+    cursor = None
+    while True:
+        kwargs: dict = {
+            "database_id": config.NOTION_FOOD_DB_ID,
+            "filter": query_filter,
+            "sorts": query_sorts,
+            "page_size": 100,
+        }
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        response = await notion.databases.query(**kwargs)
+        for page in response["results"]:
+            props = page["properties"]
+            titles = props.get("Name", {}).get("title", [])
+            name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
+            date_val = (props.get("Date", {}).get("date") or {}).get("start", "")
+            rows.append({
+                "date":      date_val,
+                "meal_type": (props.get("Meal Type",  {}).get("select") or {}).get("name", ""),
+                "log_method":(props.get("Log Method", {}).get("select") or {}).get("name", ""),
+                "name":      name,
+                "calories":  props.get("Calories",  {}).get("number") or 0,
+                "protein_g": props.get("Protein",   {}).get("number") or 0,
+                "carbs_g":   props.get("Carbs",     {}).get("number") or 0,
+                "fat_g":     props.get("Fat",       {}).get("number") or 0,
+                "fiber_g":   props.get("Fiber",     {}).get("number") or 0,
+                "sugar_g":   props.get("Sugar",     {}).get("number") or 0,
+                "sodium_mg": props.get("Sodium",    {}).get("number") or 0,
+                "portion_size": (
+                    (props.get("Portion Size", {}).get("rich_text") or [{}])[0]
+                    .get("text", {}).get("content", "")
+                ),
+                "notes": (
+                    (props.get("Notes", {}).get("rich_text") or [{}])[0]
+                    .get("text", {}).get("content", "")
+                ),
+            })
+        if not response.get("has_more"):
+            break
+        cursor = response.get("next_cursor")
     return rows

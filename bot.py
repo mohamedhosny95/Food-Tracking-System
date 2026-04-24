@@ -1179,9 +1179,14 @@ async def barcode_fallback_callback(
 async def water_amount_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    raw = update.message.text.strip().lower().replace("ml", "").replace("l", "000").strip()
+    text = update.message.text.strip().lower()
     try:
-        amount = int(float(raw))
+        if text.endswith("ml"):
+            amount = int(float(text[:-2]))
+        elif text.endswith("l"):
+            amount = int(float(text[:-1]) * 1000)
+        else:
+            amount = int(float(text))
     except ValueError:
         await update.message.reply_text("Please type a number, e.g. 500")
         return WAITING_FOR_WATER
@@ -2224,8 +2229,10 @@ async def chart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     data  = await get_daily_totals_range(today - timedelta(days=6), today)
     cal_goal = _get_goal(context.bot_data, "calories")
 
-    cal_buf   = _generate_calorie_chart(data, cal_goal)
-    macro_buf = _generate_macro_chart(data)
+    cal_buf, macro_buf = await asyncio.gather(
+        asyncio.to_thread(_generate_calorie_chart, data, cal_goal),
+        asyncio.to_thread(_generate_macro_chart, data),
+    )
 
     logged  = [d for d in data if d["calories"] > 0]
     avg     = sum(d["calories"] for d in logged) / len(logged) if logged else 0
