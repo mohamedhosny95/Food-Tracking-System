@@ -314,7 +314,7 @@ async def ensure_saved_meals_db() -> None:
             if result.get("object") != "database":
                 continue
             title_parts = result.get("title", [])
-            title = title_parts[0]["text"]["content"] if title_parts else ""
+            title = (title_parts[0].get("text") or {}).get("content", "") if title_parts else ""
             if title == "Saved Meals":
                 db_id = result["id"]
                 config.NOTION_SAVED_MEALS_DB_ID = db_id
@@ -474,7 +474,7 @@ async def get_saved_meals(limit: int = 20) -> list[dict]:
             continue
         props = page["properties"]
         titles = props.get("Name", {}).get("title", [])
-        name = titles[0]["text"]["content"] if titles else "Unknown"
+        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
 
         def _num(key: str) -> float:
             return float(props.get(key, {}).get("number") or 0)
@@ -547,7 +547,7 @@ async def get_recent_meals(limit: int = 5) -> list[dict]:
     for page in response["results"]:
         props = page["properties"]
         titles = props.get("Name", {}).get("title", [])
-        name = titles[0]["text"]["content"] if titles else "Unknown"
+        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
         if name in seen:
             continue
         seen.add(name)
@@ -596,7 +596,7 @@ async def search_restaurants(query: str) -> list[dict]:
     for page in response["results"]:
         props = page["properties"]
         titles = props.get("Name", {}).get("title", [])
-        name = titles[0]["text"]["content"] if titles else ""
+        name = (titles[0].get("text") or {}).get("content", "") if titles else ""
         if name and name.lower() in query_lower:
             matches.append({
                 "page_id": page["id"],
@@ -772,7 +772,7 @@ async def get_yesterday_meals() -> list[dict]:
     for page in response["results"]:
         props = page["properties"]
         titles = props.get("Name", {}).get("title", [])
-        name = titles[0]["text"]["content"] if titles else "Unknown"
+        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
         meals.append({
             "page_id": page["id"],
             "name": name,
@@ -935,7 +935,7 @@ async def get_food_entries_range(start: date, end: date) -> list[dict]:
     for page in response["results"]:
         props = page["properties"]
         titles = props.get("Name", {}).get("title", [])
-        name = titles[0]["text"]["content"] if titles else "Unknown"
+        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
         date_val = (props.get("Date", {}).get("date") or {}).get("start", "")
         rows.append({
             "date":      date_val,

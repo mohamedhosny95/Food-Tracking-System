@@ -334,7 +334,6 @@ async def _send_macro_remaining(msg, nutrition: NutritionData, context) -> None:
 async def _undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fires when user taps ↩ Undo on a just-logged meal."""
     query = update.callback_query
-    await query.answer()
     page_id = context.user_data.get("last_food_page_id")
     if not page_id:
         await query.answer("Nothing to undo.", show_alert=True)
@@ -343,6 +342,7 @@ async def _undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await archive_food_entry(page_id)
         context.user_data.pop("last_food_page_id", None)
         context.user_data.pop("last_nutrition", None)
+        await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("↩ Last meal entry deleted.")
     except Exception:
@@ -1366,7 +1366,7 @@ async def recent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.edit_text("No saved meals yet. Log meals and tap ⭐ to save them.")
         return
 
-    context.bot_data["recent_meals"] = {m["page_id"]: m for m in meals}
+    context.user_data["recent_meals"] = {m["page_id"]: m for m in meals}
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"{m['name'][:26]} ({m['calories']:.0f} kcal)"
@@ -1384,7 +1384,7 @@ async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
 
     page_id = query.data[len("relog_"):]
-    meal = context.bot_data.get("recent_meals", {}).get(page_id)
+    meal = context.user_data.get("recent_meals", {}).get(page_id)
     if not meal:
         await query.edit_message_text("Meal data expired. Use /recent to refresh.")
         return
@@ -1499,7 +1499,7 @@ async def yesterday_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await msg.edit_text(f"No meals logged on {yesterday}.")
         return
 
-    context.bot_data["yesterday_meals"] = meals
+    context.user_data["yesterday_meals"] = meals
     total_cal = sum(m["calories"] for m in meals)
     yesterday = (date.today() - timedelta(days=1)).strftime("%b %d")
     lines = [f"Yesterday ({yesterday}) — {total_cal:.0f} kcal total\n"]
@@ -1526,7 +1526,7 @@ async def copy_yesterday_callback(
     query = update.callback_query
     await query.answer()
 
-    meals = context.bot_data.get("yesterday_meals", [])
+    meals = context.user_data.get("yesterday_meals", [])
     if not meals:
         await query.edit_message_text("Session expired. Run /yesterday again.")
         return
@@ -1811,7 +1811,7 @@ async def templates_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return TEMPLATE_CHOOSING_PORTION
 
-    context.bot_data["template_meals"] = {m["page_id"]: m for m in meals}
+    context.user_data["template_meals"] = {m["page_id"]: m for m in meals}
     await msg.edit_text(
         "Tap a meal to log it  ·  🗑️ to delete  ·  ➕ to add new:",
         reply_markup=_templates_keyboard(meals),
@@ -1826,7 +1826,7 @@ async def template_select_callback(
     await query.answer()
 
     page_id = query.data[len("tpl_"):]
-    meal = context.bot_data.get("template_meals", {}).get(page_id)
+    meal = context.user_data.get("template_meals", {}).get(page_id)
     if not meal:
         await query.edit_message_text("Meal data expired. Use /templates to refresh.")
         return ConversationHandler.END
@@ -1981,7 +1981,7 @@ async def template_delete_callback(
     logger = logging.getLogger(__name__)
 
     page_id = query.data[len("del_tpl_"):]
-    cache: dict = context.bot_data.setdefault("template_meals", {})
+    cache: dict = context.user_data.setdefault("template_meals", {})
     saved_item = cache.get(page_id)
     deleted_name = (saved_item or {}).get("name", "Meal")
 
@@ -2482,7 +2482,10 @@ def main() -> None:
         await _maybe_create_weekly_review(application)
         await _maybe_create_monthly_review(application)
         await _ensure_weight_property()
-        await _load_fasting_from_notion(application.bot_data)
+        try:
+            await _load_fasting_from_notion(application.bot_data)
+        except Exception:
+            logging.getLogger(__name__).warning("Could not load fasting status from Notion on startup")
         # Load persisted user goals from Notion
         try:
             goals = await get_user_goals()
