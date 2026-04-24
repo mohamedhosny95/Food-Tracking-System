@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import io
 import logging
@@ -1266,7 +1267,6 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def save_meal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
 
     nutrition: NutritionData | None = context.user_data.get("last_nutrition")
     meal_type: str = context.user_data.get("last_meal_type", "")
@@ -1275,6 +1275,7 @@ async def save_meal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Session expired — nothing to save.", show_alert=True)
         return
 
+    await query.answer()
     await save_to_saved_meals(nutrition, meal_type)
     # Remove the save button after tapping
     await query.edit_message_reply_markup(reply_markup=None)
@@ -1285,13 +1286,13 @@ async def add_restaurant_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     query = update.callback_query
-    await query.answer()
 
     name = context.user_data.get("last_restaurant_name", "")
     if not name:
         await query.answer("Restaurant name not found.", show_alert=True)
         return
 
+    await query.answer()
     await add_restaurant(name)
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(f"➕ \"{name}\" added to your favorites.")
@@ -1977,23 +1978,23 @@ async def template_delete_callback(
     Notion call) and rebuild the keyboard from that cache.
     """
     query = update.callback_query
-    await query.answer()
     logger = logging.getLogger(__name__)
 
     page_id = query.data[len("del_tpl_"):]
-
-    # Remove from local cache FIRST — this is what we'll display
     cache: dict = context.bot_data.setdefault("template_meals", {})
-    deleted_name = cache.pop(page_id, {}).get("name", "Meal")
+    saved_item = cache.get(page_id)
+    deleted_name = (saved_item or {}).get("name", "Meal")
 
     try:
         await delete_saved_meal(page_id)
         logger.info("Deleted template %s ('%s')", page_id, deleted_name)
+        cache.pop(page_id, None)
     except Exception:
         logger.exception("Failed to delete template %s", page_id)
-        # Restore the item in cache so the list stays consistent
         await query.answer("Could not delete from Notion. Try again.", show_alert=True)
         return TEMPLATE_CHOOSING_PORTION
+
+    await query.answer()
 
     # Rebuild from the now-updated local cache (no Notion round-trip needed)
     remaining = list(cache.values())
@@ -2443,11 +2444,11 @@ async def _ensure_weight_property() -> None:
                 "Fasting":            {"checkbox": {}},
                 # Goal overrides stored on the special ⚙️ Goals page
                 "Goal Calories":      {"number": {"format": "number"}},
-                "Goal Protein (g)":   {"number": {"format": "number"}},
-                "Goal Carbs (g)":     {"number": {"format": "number"}},
-                "Goal Fat (g)":       {"number": {"format": "number"}},
-                "Goal Fiber (g)":     {"number": {"format": "number"}},
-                "Goal Water (ml)":    {"number": {"format": "number"}},
+                "Goal Protein":       {"number": {"format": "number"}},
+                "Goal Carbs":         {"number": {"format": "number"}},
+                "Goal Fat":           {"number": {"format": "number"}},
+                "Goal Fiber":         {"number": {"format": "number"}},
+                "Goal Water":         {"number": {"format": "number"}},
             },
         )
     except Exception:
