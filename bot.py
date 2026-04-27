@@ -4,6 +4,7 @@ import io
 import logging
 import logging.handlers
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
@@ -1341,7 +1342,13 @@ async def water_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     try:
-        amount = int(context.args[0].lower().replace("ml", "").strip())
+        arg = context.args[0].lower().strip()
+        if arg.endswith("ml"):
+            amount = int(float(arg[:-2]))
+        elif arg.endswith("l"):
+            amount = int(float(arg[:-1]) * 1000)
+        else:
+            amount = int(float(arg))
     except ValueError:
         await update.message.reply_text("Please specify a number, e.g. /water 500")
         return
@@ -1839,8 +1846,7 @@ async def template_select_callback(
     context.user_data["template_meal"] = meal
 
     # Try to parse a gram weight from the portion_size string (e.g. "100g")
-    import re as _re
-    m = _re.search(r"(\d+(?:\.\d+)?)\s*g", meal.get("portion_size", ""), _re.I)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*g", meal.get("portion_size", ""), re.I)
     est_g = float(m.group(1)) if m else 0.0
     context.user_data["template_est_g"] = est_g
 
@@ -1942,7 +1948,21 @@ async def template_custom_weight_handler(
         return TEMPLATE_ENTERING_WEIGHT
 
     est_g = context.user_data.get("template_est_g", 0.0)
-    factor = user_g / est_g if est_g > 0 else 1.0
+    if est_g <= 0:
+        await update.message.reply_text(
+            "This template has no gram reference, so I can't scale by weight.\n\n"
+            "Please use 🥣 Small / 🍽️ Medium / 🫕 Large or ⚖️ Custom weight on a meal "
+            "that was saved with a gram amount in its portion size."
+        )
+        await update.message.reply_text(
+            f"{meal['name']}\n"
+            f"Calories: {meal['calories']:.0f} kcal  |  Protein: {meal.get('protein_g', 0):.1f}g\n\n"
+            f"📏 How much are you having?",
+            reply_markup=_portion_size_keyboard(0),
+        )
+        return TEMPLATE_CHOOSING_PORTION
+
+    factor = user_g / est_g
 
     nutrition = NutritionData(
         food_name=meal["name"],
@@ -2167,9 +2187,9 @@ def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
     ax.legend(loc="upper right", facecolor="#1a1a2e",
               labelcolor="white", edgecolor="#444", fontsize=10)
 
-    plt.tight_layout()
+    fig.tight_layout()
     buf = _io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150,
+    fig.savefig(buf, format="png", dpi=150,
                 bbox_inches="tight", facecolor=fig.get_facecolor())
     buf.seek(0)
     plt.close(fig)
@@ -2210,9 +2230,9 @@ def _generate_macro_chart(data: list[dict]) -> "io.BytesIO":
     ax.legend(loc="upper right", facecolor="#1a1a2e", labelcolor="white",
               edgecolor="#444", fontsize=10)
 
-    plt.tight_layout()
+    fig.tight_layout()
     buf = _io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150,
+    fig.savefig(buf, format="png", dpi=150,
                 bbox_inches="tight", facecolor=fig.get_facecolor())
     buf.seek(0)
     plt.close(fig)

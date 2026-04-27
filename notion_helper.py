@@ -506,25 +506,34 @@ async def get_streak() -> int:
     """Returns the number of consecutive days ending today with at least one food entry."""
     today = date.today()
     start = today - timedelta(days=90)
-    response = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
-        filter={
-            "and": [
-                {"property": "Date", "date": {"on_or_after": start.isoformat()}},
-                {"property": "Date", "date": {"on_or_before": today.isoformat()}},
-            ]
-        },
-        page_size=200,
-    )
+    query_filter = {
+        "and": [
+            {"property": "Date", "date": {"on_or_after": start.isoformat()}},
+            {"property": "Date", "date": {"on_or_before": today.isoformat()}},
+        ]
+    }
     logged_dates: set[date] = set()
-    for page in response["results"]:
-        date_prop = (page["properties"].get("Date", {}).get("date") or {})
-        raw = date_prop.get("start", "")
-        if raw:
-            try:
-                logged_dates.add(date.fromisoformat(raw))
-            except ValueError:
-                pass
+    cursor = None
+    while True:
+        kwargs: dict = {
+            "database_id": config.NOTION_FOOD_DB_ID,
+            "filter": query_filter,
+            "page_size": 100,
+        }
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        response = await notion.databases.query(**kwargs)
+        for page in response["results"]:
+            date_prop = (page["properties"].get("Date", {}).get("date") or {})
+            raw = date_prop.get("start", "")
+            if raw:
+                try:
+                    logged_dates.add(date.fromisoformat(raw))
+                except ValueError:
+                    pass
+        if not response.get("has_more"):
+            break
+        cursor = response.get("next_cursor")
     streak = 0
     check = today
     while check in logged_dates:
