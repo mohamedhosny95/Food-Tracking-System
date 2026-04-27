@@ -57,6 +57,7 @@ from notion_helper import (
     get_week_calorie_bank,
     get_last_month_data,
     create_monthly_review_page,
+    get_recent_food_entries,
 )
 
 
@@ -358,6 +359,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Food Tracker ready.\n\n"
         "Send a photo or voice message to log a meal, or use /log.\n\n"
         "/summary   — today's macro progress\n"
+        "/calories  — quick calorie check\n"
+        "/week      — this week's totals + daily breakdown\n"
+        "/streak    — your current logging streak\n"
+        "/history   — last 10 logged meals\n"
+        "/delete    — delete a recent entry\n"
         "/recent    — re-log a saved meal\n"
         "/yesterday — copy yesterday's meals\n"
         "/templates — manage and quick-log meal templates\n"
@@ -2143,6 +2149,160 @@ async def template_new_confirm_callback(
     return ConversationHandler.END
 
 
+# ── /week ──────────────────────────────────────────────────────────────────────
+
+async def week_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Fetching this week's data...")
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    data = await get_daily_totals_range(week_start, today)
+
+    logged = [d for d in data if d["calories"] > 0]
+    if not logged:
+        await msg.edit_text("No meals logged this week yet. Use /log to add your first.")
+        return
+
+    cal_goal = _get_goal(context.bot_data, "calories")
+    total_cal   = sum(d["calories"]  for d in logged)
+    total_prot  = sum(d["protein_g"] for d in logged)
+    total_carbs = sum(d["carbs_g"]   for d in logged)
+    total_fat   = sum(d["fat_g"]     for d in logged)
+    total_water = sum(d["water_ml"]  for d in data)
+    avg_cal = total_cal / len(logged)
+
+    day_lines = []
+    for d in data:
+        day_name = d["date"].strftime("%a")
+        cal = d["calories"]
+        if cal > 0:
+            filled = min(round(cal / cal_goal * 5), 5) if cal_goal else 0
+            bar = "█" * filled + "░" * (5 - filled)
+            day_lines.append(f"{day_name}  {bar}  {cal:.0f} kcal")
+        else:
+            day_lines.append(f"{day_name}  ░░░░░  —")
+
+    days_elapsed = today.weekday() + 1
+    lines = [
+        f"📅 This week  ({week_start.strftime('%b %d')} – {today.strftime('%b %d')})",
+        f"Days logged: {len(logged)}/{days_elapsed}",
+        "",
+        *day_lines,
+        "",
+        "Totals this week:",
+        f"  Calories: {total_cal:.0f} kcal",
+        f"  Protein:  {total_prot:.0f} g",
+        f"  Carbs:    {total_carbs:.0f} g",
+        f"  Fat:      {total_fat:.0f} g",
+        "",
+        f"Daily avg:  {avg_cal:.0f} kcal  (goal: {cal_goal})",
+    ]
+    if total_water > 0:
+        lines.append(f"Total water: {total_water:.0f} ml")
+    await msg.edit_text("\n".join(lines))
+
+
+# ── /streak ─────────────────────────────────────────────────────────────────────
+
+async def streak_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    streak = await get_streak()
+    if streak == 0:
+        await update.message.reply_text(
+            "No streak yet — log a meal today to start one!"
+        )
+    elif streak == 1:
+        await update.message.reply_text(
+            "🔥 1 day streak — log again tomorrow to keep it going!"
+        )
+    else:
+        await update.message.reply_text(f"🔥 {streak} day streak — keep it up!")
+
+
+# ── /calories ──────────────────────────────────────────────────────────────────
+
+async def calories_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    totals = await get_today_totals(date.today())
+    cal = totals.get("calories", 0) if totals else 0
+    cal_goal = _get_goal(context.bot_data, "calories")
+    bar = _progress_bar(cal, cal_goal)
+    pct = min(int(cal / cal_goal * 100), 100) if cal_goal > 0 else 0
+    rem = max(cal_goal - cal, 0)
+    await update.message.reply_text(
+        f"🔥 Calories today\n\n"
+        f"{bar} {cal:.0f}/{cal_goal} kcal ({pct}%)\n"
+        f"{rem:.0f} kcal remaining"
+    )
+
+
+# ── /history ───────────────────────────────────────────────────────────────────
+
+async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Fetching recent entries...")
+    entries = await get_recent_food_entries(10)
+    if not entries:
+        await msg.edit_text("No food entries found.")
+        return
+    lines = ["Recent meals:\n"]
+    for e in entries:
+        tag = f"[{e['meal_type']}] " if e["meal_type"] else ""
+        date_str = e["date"][5:] if e["date"] else "?"   # "MM-DD"
+        cal_str = f"  {e['calories']:.0f} kcal" if e["calories"] else ""
+        lines.append(f"{date_str}  {tag}{e['name'][:30]}{cal_str}")
+    await msg.edit_text("\n".join(lines))
+
+
+# ── /delete ────────────────────────────────────────────────────────────────────
+
+async def delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Fetching recent entries...")
+    entries = await get_recent_food_entries(10)
+    if not entries:
+        await msg.edit_text("No recent entries to delete.")
+        return
+    context.user_data["delete_entries"] = {e["page_id"]: e for e in entries}
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{e['date'][5:] if e['date'] else '?'}  {e['name'][:28]}  {e['calories']:.0f} kcal",
+            callback_data=f"del_entry_{e['page_id']}",
+        )]
+        for e in entries
+    ])
+    await msg.edit_text("Tap an entry to delete it:", reply_markup=keyboard)
+
+
+async def delete_entry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    page_id = query.data[len("del_entry_"):]
+    entry = context.user_data.get("delete_entries", {}).get(page_id)
+    if not entry:
+        await query.edit_message_text("Entry not found. Use /delete to refresh.")
+        return
+    try:
+        await archive_food_entry(page_id)
+        context.user_data.get("delete_entries", {}).pop(page_id, None)
+        await query.edit_message_text(
+            f"🗑️ Deleted: {entry['name']} ({entry['calories']:.0f} kcal)"
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to delete entry %s", page_id)
+        await query.edit_message_text("Could not delete. Please try again.")
+
+
 # ── /chart ─────────────────────────────────────────────────────────────────────
 
 def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
@@ -2516,6 +2676,11 @@ def main() -> None:
             BotCommand("dinner",    "Quick-log dinner"),
             BotCommand("snack",     "Quick-log a snack"),
             BotCommand("summary",   "Today's macro progress"),
+            BotCommand("calories",  "Quick calorie check for today"),
+            BotCommand("week",      "This week's totals and daily breakdown"),
+            BotCommand("streak",    "Your current logging streak"),
+            BotCommand("history",   "Last 10 logged meals"),
+            BotCommand("delete",    "Delete a recent food entry"),
             BotCommand("recent",    "Re-log a saved meal"),
             BotCommand("yesterday", "Copy yesterday's meals"),
             BotCommand("templates", "Manage and quick-log meal templates"),
@@ -2653,6 +2818,12 @@ def main() -> None:
     app.add_handler(CommandHandler("yesterday", yesterday_handler))
     app.add_handler(CommandHandler("export",    export_handler))
     app.add_handler(CommandHandler("chart",     chart_handler))
+    app.add_handler(CommandHandler("week",      week_handler))
+    app.add_handler(CommandHandler("streak",    streak_handler))
+    app.add_handler(CommandHandler("calories",  calories_handler))
+    app.add_handler(CommandHandler("history",   history_handler))
+    app.add_handler(CommandHandler("delete",    delete_handler))
+    app.add_handler(CallbackQueryHandler(delete_entry_callback, pattern="^del_entry_"))
     # Goals callbacks that appear outside the conversation (e.g. "Edit another" tap)
     app.add_handler(CallbackQueryHandler(goals_edit_menu_callback, pattern="^goals_edit_menu$"))
     app.add_handler(CallbackQueryHandler(goals_pick_callback,      pattern="^goal_set_"))

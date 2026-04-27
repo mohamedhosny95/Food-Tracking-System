@@ -807,6 +807,28 @@ async def get_yesterday_meals() -> list[dict]:
     return meals
 
 
+async def get_recent_food_entries(limit: int = 10) -> list[dict]:
+    """Returns the most recently created food entries across all dates."""
+    response = await notion.databases.query(
+        database_id=config.NOTION_FOOD_DB_ID,
+        sorts=[{"timestamp": "created_time", "direction": "descending"}],
+        page_size=limit,
+    )
+    entries = []
+    for page in response["results"]:
+        props = page["properties"]
+        titles = props.get("Name", {}).get("title", [])
+        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
+        entries.append({
+            "page_id": page["id"],
+            "name": name,
+            "calories": float(props.get("Calories", {}).get("number") or 0),
+            "meal_type": (props.get("Meal Type", {}).get("select") or {}).get("name", ""),
+            "date": (props.get("Date", {}).get("date") or {}).get("start", ""),
+        })
+    return entries
+
+
 # ── Chart data ────────────────────────────────────────────────────────────────
 
 async def get_daily_totals_range(start: date, end: date) -> list[dict]:
