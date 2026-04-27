@@ -170,7 +170,7 @@ async def archive_food_entry(page_id: str) -> None:
     logger.info("Archived food entry %s", page_id)
 
 
-async def get_week_calorie_bank() -> dict:
+async def get_week_calorie_bank(calorie_goal: int = 0) -> dict:
     """Returns calories consumed vs expected for the current Mon–today window."""
     today = date.today()
     week_start = today - timedelta(days=today.weekday())
@@ -194,7 +194,8 @@ async def get_week_calorie_bank() -> dict:
         return float(prop.get("number") or 0)
 
     total_cal = sum(_rollup(p["properties"], "Total Calories") for p in response["results"])
-    expected = config.DAILY_CALORIES_GOAL * days_elapsed
+    goal = calorie_goal if calorie_goal > 0 else config.DAILY_CALORIES_GOAL
+    expected = goal * days_elapsed
     return {
         "days_elapsed": days_elapsed,
         "total_calories": round(total_cal),

@@ -1282,8 +1282,12 @@ async def save_meal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     await query.answer()
-    await save_to_saved_meals(nutrition, meal_type)
-    # Remove the save button after tapping
+    try:
+        await save_to_saved_meals(nutrition, meal_type)
+    except Exception:
+        logging.getLogger(__name__).exception("save_to_saved_meals failed")
+        await query.message.reply_text("Could not save to Notion. Please try again.")
+        return
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(f"⭐ \"{nutrition.food_name}\" saved to frequent meals.")
 
@@ -1299,7 +1303,12 @@ async def add_restaurant_callback(
         return
 
     await query.answer()
-    await add_restaurant(name)
+    try:
+        await add_restaurant(name)
+    except Exception:
+        logging.getLogger(__name__).exception("add_restaurant failed")
+        await query.message.reply_text("Could not save restaurant to Notion. Please try again.")
+        return
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(f"➕ \"{name}\" added to your favorites.")
 
@@ -1312,10 +1321,11 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     msg = await update.message.reply_text("Fetching today's totals...")
     fasting = _is_fasting(context.bot_data)
+    cal_goal = _get_goal(context.bot_data, "calories")
     totals, streak, week_bank = await asyncio.gather(
         get_today_totals(date.today()),
         get_streak(),
-        get_week_calorie_bank(),
+        get_week_calorie_bank(cal_goal),
     )
     if not totals and not fasting:
         await msg.edit_text("No meals logged today yet. Use /log to add your first meal.")
@@ -2353,8 +2363,9 @@ async def goals_input_handler(
     raw = update.message.text.strip().replace(unit, "").strip()
     try:
         new_val = int(float(raw))
-        assert new_val > 0
-    except (ValueError, AssertionError):
+        if new_val <= 0:
+            raise ValueError("goal must be positive")
+    except ValueError:
         await update.message.reply_text(f"Please enter a positive number in {unit}.")
         return SETTING_GOALS
 
@@ -2401,7 +2412,13 @@ def _start_health_server(port: int) -> None:
         def log_message(self, fmt, *args) -> None:
             pass  # silence access logs
 
-    server = HTTPServer(("0.0.0.0", port), _Handler)
+    try:
+        server = HTTPServer(("0.0.0.0", port), _Handler)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Could not bind health server on port %d (%s) — continuing without it", port, exc
+        )
+        return
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logging.getLogger(__name__).info("Health server started on port %d", port)
@@ -2413,8 +2430,10 @@ async def self_ping(context) -> None:
     if not render_url:
         return
     import urllib.request
-    try:
+    def _ping():
         urllib.request.urlopen(f"{render_url}/health", timeout=10)
+    try:
+        await asyncio.to_thread(_ping)
         logging.getLogger(__name__).debug("Self-ping OK → %s/health", render_url)
     except Exception as exc:
         logging.getLogger(__name__).warning("Self-ping failed: %s", exc)
