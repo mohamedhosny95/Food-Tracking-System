@@ -370,6 +370,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/chart     — 7-day calorie trend chart\n"
         "/goals     — view or update macro goals\n"
         "/weight    — log your body weight (e.g. /weight 85)\n"
+        "/weightchart — weight trend chart\n"
         "/fasting   — toggle fasting mode for today\n"
         "/export    — export your food log as CSV"
     )
@@ -1492,6 +1493,108 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("\n".join(lines))
 
 
+# ── /weightchart ──────────────────────────────────────────────────────────────
+
+def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
+    import io as _io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from datetime import date as _date
+
+    dates   = [_date.fromisoformat(d["date"]) for d in data]
+    weights = [d["weight_kg"] for d in data]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor("#1a1a2e")
+    ax.set_facecolor("#16213e")
+
+    ax.plot(dates, weights, color="#4CAF50", linewidth=2.5, marker="o",
+            markersize=7, markerfacecolor="#81C784", zorder=3)
+
+    # Annotate each point with its value
+    for d, w in zip(dates, weights):
+        ax.annotate(
+            f"{w:.1f}",
+            xy=(d, w),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center", fontsize=9,
+            color="white", fontweight="bold",
+        )
+
+    # Trend line (linear regression) when we have enough points
+    if len(dates) >= 3:
+        import numpy as np
+        x_num = mdates.date2num(dates)
+        m, b = np.polyfit(x_num, weights, 1)
+        ax.plot(
+            dates,
+            [m * mdates.date2num(d) + b for d in dates],
+            color="#FF9800", linewidth=1.5, linestyle="--",
+            alpha=0.7, label="Trend",
+            zorder=2,
+        )
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    fig.autofmt_xdate(rotation=30, ha="right")
+    ax.tick_params(axis="x", colors="#cccccc", labelsize=9)
+    ax.tick_params(axis="y", colors="#cccccc", labelsize=10)
+    ax.set_ylabel("Weight (kg)", color="#cccccc", fontsize=11)
+    ax.set_title("Weight Trend", color="white", fontsize=14, fontweight="bold", pad=15)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["bottom", "left"]:
+        ax.spines[spine].set_color("#444")
+    ax.yaxis.grid(True, color="#333", zorder=0)
+    ax.set_axisbelow(True)
+    if len(dates) >= 3:
+        ax.legend(loc="upper right", facecolor="#1a1a2e",
+                  labelcolor="white", edgecolor="#444", fontsize=10)
+
+    fig.tight_layout()
+    buf = _io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150,
+                bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+async def weightchart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    msg = await update.message.reply_text("Building weight chart...")
+    history = await get_recent_weights(12)   # up to 12 weigh-ins (~3 months weekly)
+    if len(history) < 2:
+        await msg.edit_text(
+            "Not enough weight entries yet — log at least 2 weigh-ins with /weight [kg] to see a chart."
+        )
+        return
+
+    data = list(reversed(history))   # chronological order for the chart
+    chart_buf = await asyncio.to_thread(_generate_weight_chart, data)
+
+    first_w = data[0]["weight_kg"]
+    last_w  = data[-1]["weight_kg"]
+    delta   = last_w - first_w
+    sign    = "+" if delta >= 0 else ""
+    weeks   = len(data)
+
+    await msg.delete()
+    await update.message.reply_photo(
+        photo=chart_buf,
+        caption=(
+            f"Weight over last {weeks} weigh-ins\n"
+            f"Start: {first_w:.1f} kg → Now: {last_w:.1f} kg  ({sign}{delta:.1f} kg)"
+        ),
+    )
+
+
 # ── /fasting ───────────────────────────────────────────────────────────────────
 
 async def fasting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1787,6 +1890,30 @@ async def monthly_weighin_reminder(context) -> None:
             "Log your current weight with: /weight [kg]\n"
             "e.g. /weight 85\n\n"
             "I'll compare it to your macro targets and flag any adjustments."
+        ),
+    )
+
+
+async def weight_nudge_sunday(context) -> None:
+    """Sent Sunday morning if no weight logged this week yet."""
+    if date.today().weekday() != 6:   # 6 = Sunday
+        return
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id:
+        return
+    # Skip if weight was already logged this week
+    recent = await get_recent_weights(1)
+    if recent:
+        today = date.today()
+        week_start = today - timedelta(days=today.weekday())
+        if recent[0]["date"] >= week_start.isoformat():
+            return
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Sunday weigh-in time!\n\n"
+            "Log your weight with /weight [kg] — e.g. /weight 85\n\n"
+            "Use /weightchart to see your trend over time."
         ),
     )
 
@@ -2690,10 +2817,12 @@ def main() -> None:
             BotCommand("recent",    "Re-log a saved meal"),
             BotCommand("yesterday", "Copy yesterday's meals"),
             BotCommand("templates", "Manage and quick-log meal templates"),
-            BotCommand("chart",     "7-day calorie + macro trend charts"),
-            BotCommand("goals",     "View or update macro goals"),
-            BotCommand("fasting",   "Toggle fasting mode for today"),
-            BotCommand("export",    "Export your food log as CSV"),
+            BotCommand("chart",       "7-day calorie + macro trend charts"),
+            BotCommand("weight",      "Log your body weight (e.g. /weight 85)"),
+            BotCommand("weightchart", "Weight trend chart"),
+            BotCommand("goals",       "View or update macro goals"),
+            BotCommand("fasting",     "Toggle fasting mode for today"),
+            BotCommand("export",      "Export your food log as CSV"),
         ])
         await ensure_saved_meals_db()
         await _maybe_create_weekly_review(application)
@@ -2819,7 +2948,8 @@ def main() -> None:
     app.add_handler(CommandHandler("summary",   summary_handler))
     app.add_handler(CommandHandler("water",     water_handler))
     app.add_handler(CommandHandler("recent",    recent_handler))
-    app.add_handler(CommandHandler("weight",    weight_handler))
+    app.add_handler(CommandHandler("weight",      weight_handler))
+    app.add_handler(CommandHandler("weightchart", weightchart_handler))
     app.add_handler(CommandHandler("fasting",   fasting_handler))
     app.add_handler(CommandHandler("yesterday", yesterday_handler))
     app.add_handler(CommandHandler("export",    export_handler))
@@ -2870,6 +3000,7 @@ def main() -> None:
     jq.run_daily(check_incomplete_day,   time=_local_to_utc(20, 0))   # 8:00pm local
     jq.run_monthly(monthly_weighin_reminder,                           # 1st of month 9am
                    when=_local_to_utc(9, 0), day=1)
+    jq.run_daily(weight_nudge_sunday, time=_local_to_utc(8, 0))      # 8am local (fires daily, acts only on Sunday)
 
     # Self-ping every 10 min to keep Render free-tier alive (no-op if not on Render)
     jq.run_repeating(self_ping, interval=600, first=60)
