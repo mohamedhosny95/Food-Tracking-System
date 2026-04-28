@@ -1254,8 +1254,10 @@ async def weight_input_handler(
     # Macro suggestions
     suggested_cal = round(weight * config.KCAL_PER_KG)
     suggested_protein = round(weight * config.PROTEIN_PER_KG)
-    diff_cal = suggested_cal - config.DAILY_CALORIES_GOAL
-    diff_prot = suggested_protein - config.DAILY_PROTEIN_GOAL
+    cal_goal  = _get_goal(context.bot_data, "calories")
+    prot_goal = _get_goal(context.bot_data, "protein_g")
+    diff_cal = suggested_cal - cal_goal
+    diff_prot = suggested_protein - prot_goal
     if abs(diff_cal) >= 50 or abs(diff_prot) >= 5:
         sign_cal  = "+" if diff_cal  >= 0 else ""
         sign_prot = "+" if diff_prot >= 0 else ""
@@ -1470,8 +1472,10 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Suggest updated macro targets based on weight
     suggested_cal = round(weight * 33)
     suggested_protein = round(weight * 2.0)
-    diff_cal = suggested_cal - config.DAILY_CALORIES_GOAL
-    diff_prot = suggested_protein - config.DAILY_PROTEIN_GOAL
+    cal_goal  = _get_goal(context.bot_data, "calories")
+    prot_goal = _get_goal(context.bot_data, "protein_g")
+    diff_cal = suggested_cal - cal_goal
+    diff_prot = suggested_protein - prot_goal
 
     lines = [f"Weight logged: {weight:.1f} kg"]
     if abs(diff_cal) >= 50 or abs(diff_prot) >= 5:
@@ -1480,8 +1484,8 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines += [
             "",
             "Based on your weight, suggested targets:",
-            f"Calories: {suggested_cal} kcal ({sign_cal}{diff_cal} vs current {config.DAILY_CALORIES_GOAL})",
-            f"Protein:  {suggested_protein}g ({sign_prot}{diff_prot} vs current {config.DAILY_PROTEIN_GOAL}g)",
+            f"Calories: {suggested_cal} kcal ({sign_cal}{diff_cal} vs current {cal_goal})",
+            f"Protein:  {suggested_protein}g ({sign_prot}{diff_prot}g vs current {prot_goal}g)",
             "",
             "To update: tell me the new values and I'll apply them.",
         ]
@@ -2602,8 +2606,9 @@ async def self_ping(context) -> None:
 # ── Weekly review check ────────────────────────────────────────────────────────
 
 async def _maybe_create_weekly_review(app: Application) -> None:
-    """Runs on startup. If it's Saturday, creates last week's review page in Notion."""
-    if datetime.now().weekday() != 5:  # 5 = Saturday
+    """Runs on startup. If it's Saturday in the user's timezone, creates last week's review page in Notion."""
+    _user_tz = timezone(timedelta(hours=config.TIMEZONE_HOURS))
+    if datetime.now(_user_tz).weekday() != 5:  # 5 = Saturday
         return
     if not config.NOTION_PARENT_PAGE_ID:
         return
@@ -2620,8 +2625,9 @@ async def _maybe_create_weekly_review(app: Application) -> None:
 
 
 async def _maybe_create_monthly_review(app: Application) -> None:
-    """Runs on startup on the 1st of each month to create last month's review in Notion."""
-    if datetime.now().day != 1:
+    """Runs on startup on the 1st of each month (user's timezone) to create last month's review in Notion."""
+    _user_tz = timezone(timedelta(hours=config.TIMEZONE_HOURS))
+    if datetime.now(_user_tz).day != 1:
         return
     if not config.NOTION_PARENT_PAGE_ID:
         return

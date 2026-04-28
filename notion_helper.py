@@ -211,23 +211,34 @@ async def get_last_month_data() -> dict:
     last_month_end = first_this_month - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
 
-    response = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
-        filter={
-            "and": [
-                {"property": "Date", "date": {"on_or_after":  last_month_start.isoformat()}},
-                {"property": "Date", "date": {"on_or_before": last_month_end.isoformat()}},
-            ]
-        },
-        page_size=400,
-    )
+    query_filter = {
+        "and": [
+            {"property": "Date", "date": {"on_or_after":  last_month_start.isoformat()}},
+            {"property": "Date", "date": {"on_or_before": last_month_end.isoformat()}},
+        ]
+    }
+    all_pages = []
+    cursor = None
+    while True:
+        kwargs: dict = {
+            "database_id": config.NOTION_FOOD_DB_ID,
+            "filter": query_filter,
+            "page_size": 100,
+        }
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        response = await notion.databases.query(**kwargs)
+        all_pages.extend(response["results"])
+        if not response.get("has_more"):
+            break
+        cursor = response.get("next_cursor")
 
     totals: dict[str, float] = {
         "calories": 0, "protein_g": 0, "carbs_g": 0,
         "fat_g": 0, "fiber_g": 0, "entries": 0,
     }
     days_with_data: set[str] = set()
-    for page in response["results"]:
+    for page in all_pages:
         props = page["properties"]
         def _n(k: str) -> float:
             return float(props.get(k, {}).get("number") or 0)
