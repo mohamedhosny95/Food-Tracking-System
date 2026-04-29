@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 notion = AsyncClient(auth=config.NOTION_API_KEY)
 
 
+def _num_prop(props: dict, key: str) -> float:
+    """Extract a number value from a Notion property dict, defaulting to 0."""
+    return float(props.get(key, {}).get("number") or 0)
+
+
 # ── Daily Log ──────────────────────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
@@ -240,13 +245,11 @@ async def get_last_month_data() -> dict:
     days_with_data: set[str] = set()
     for page in all_pages:
         props = page["properties"]
-        def _n(k: str) -> float:
-            return float(props.get(k, {}).get("number") or 0)
-        totals["calories"]  += _n("Calories")
-        totals["protein_g"] += _n("Protein")
-        totals["carbs_g"]   += _n("Carbs")
-        totals["fat_g"]     += _n("Fat")
-        totals["fiber_g"]   += _n("Fiber")
+        totals["calories"]  += _num_prop(props, "Calories")
+        totals["protein_g"] += _num_prop(props, "Protein")
+        totals["carbs_g"]   += _num_prop(props, "Carbs")
+        totals["fat_g"]     += _num_prop(props, "Fat")
+        totals["fiber_g"]   += _num_prop(props, "Fiber")
         totals["entries"]   += 1
         date_prop = props.get("Date", {}).get("date", {})
         if date_prop and date_prop.get("start"):
@@ -418,6 +421,7 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
     )
     if archived_page:
         page_id = archived_page["id"]
+        old_times = int(archived_page["properties"].get("Times Logged", {}).get("number") or 1)
         await notion.pages.update(
             page_id=page_id,
             archived=False,
@@ -430,10 +434,10 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
                 "Sugar":        {"number": round(nutrition.sugar_g, 1)},
                 "Sodium":       {"number": int(nutrition.sodium_mg)},
                 "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
-                "Times Logged": {"number": 1},
+                "Times Logged": {"number": old_times + 1},
             },
         )
-        logger.info("Restored archived saved meal '%s'", nutrition.food_name)
+        logger.info("Restored archived saved meal '%s' (times logged: %d)", nutrition.food_name, old_times + 1)
         return archived_page.get("url", "")
 
     properties: dict = {
@@ -675,14 +679,11 @@ async def get_last_week_data() -> dict:
 
     for page in response["results"]:
         props = page["properties"]
-        def _n(k: str) -> float:
-            return float(props.get(k, {}).get("number") or 0)
-
-        totals["calories"]  += _n("Calories")
-        totals["protein_g"] += _n("Protein")
-        totals["carbs_g"]   += _n("Carbs")
-        totals["fat_g"]     += _n("Fat")
-        totals["fiber_g"]   += _n("Fiber")
+        totals["calories"]  += _num_prop(props, "Calories")
+        totals["protein_g"] += _num_prop(props, "Protein")
+        totals["carbs_g"]   += _num_prop(props, "Carbs")
+        totals["fat_g"]     += _num_prop(props, "Fat")
+        totals["fiber_g"]   += _num_prop(props, "Fiber")
         totals["entries"]   += 1
 
         date_prop = props.get("Date", {}).get("date", {})

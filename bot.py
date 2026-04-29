@@ -63,6 +63,9 @@ from notion_helper import (
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
+logger = logging.getLogger(__name__)
+
+
 def setup_logging() -> None:
     os.makedirs("logs", exist_ok=True)
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -131,7 +134,7 @@ def _get_goal(bot_data: dict, key: str) -> int:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def get_meal_type() -> str:
-    h = datetime.now().hour
+    h = (datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_HOURS)).hour
     if config.MEAL_BREAKFAST_START <= h < config.MEAL_LUNCH_START:   return "Breakfast"
     if config.MEAL_LUNCH_START    <= h < config.MEAL_SNACK_START:    return "Lunch"
     if config.MEAL_SNACK_START    <= h < config.MEAL_DINNER_START:   return "Snack"
@@ -389,7 +392,6 @@ _LOG_KEYBOARD = InlineKeyboardMarkup([
 
 
 async def log_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger = logging.getLogger(__name__)
     logger.info("/log triggered by user %s", update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
@@ -488,7 +490,6 @@ async def choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ── Photo entry: analyze → confirm ────────────────────────────────────────────
 
 async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger = logging.getLogger(__name__)
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
@@ -540,7 +541,6 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def photo_confirm_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     query = update.callback_query
     await query.answer()
 
@@ -615,7 +615,6 @@ async def photo_confirm_callback(
 async def photo_correction_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     nutrition: NutritionData = context.user_data.get("pending_nutrition")
     if not nutrition:
         await update.message.reply_text("Session expired. Please send the photo again.")
@@ -642,7 +641,6 @@ async def photo_correction_handler(
 async def portion_percentage_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     nutrition: NutritionData = context.user_data.get("pending_nutrition")
     if not nutrition:
         await update.message.reply_text("Session expired. Please send the photo again.")
@@ -713,7 +711,7 @@ async def macro_edit_handler(
     nutrition.protein_g = round(prot, 1)
     nutrition.carbs_g   = round(carbs, 1)
     nutrition.fat_g     = round(fat, 1)
-    nutrition.notes     = f"Macros manually edited. " + nutrition.notes
+    nutrition.notes     = ("Macros manually edited. " + nutrition.notes).strip()
 
     await update.message.reply_text(
         _confirmation_preview(nutrition),
@@ -725,7 +723,6 @@ async def macro_edit_handler(
 # ── Voice entry: transcribe → confirm ─────────────────────────────────────────
 
 async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger = logging.getLogger(__name__)
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
@@ -863,7 +860,6 @@ async def ingredients_handler(
 async def serving_type_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     query = update.callback_query
     await query.answer()
 
@@ -912,7 +908,6 @@ async def serving_type_callback(
 async def cooking_context_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     query = update.callback_query
     await query.answer()
 
@@ -1004,7 +999,6 @@ def _portion_size_question(nutrition: "NutritionData") -> str:
 async def portion_size_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     query = update.callback_query
     await query.answer()
 
@@ -1049,7 +1043,6 @@ async def portion_size_callback(
 async def custom_weight_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     nutrition: NutritionData = context.user_data.get("pending_nutrition")
     if not nutrition:
         await update.message.reply_text("Session expired. Please start again.")
@@ -1083,9 +1076,10 @@ async def custom_weight_handler(
         )
         return CONFIRMING_ANALYSIS
 
+    original_est_g = nutrition.estimated_weight_g
     _scale_nutrition(nutrition, factor)
     nutrition.portion_size = f"{int(user_weight)}g (custom)"
-    nutrition.notes = f"User-entered weight: {int(user_weight)}g (AI estimated {int(nutrition.estimated_weight_g)}g). " + nutrition.notes
+    nutrition.notes = f"User-entered weight: {int(user_weight)}g (AI estimated {int(original_est_g)}g). " + nutrition.notes
     nutrition.estimated_weight_g = user_weight
 
     await update.message.reply_text(
@@ -1104,6 +1098,8 @@ def _scale_nutrition(nutrition: "NutritionData", factor: float) -> None:
     nutrition.fiber_g   = round(nutrition.fiber_g   * factor, 1)
     nutrition.sugar_g   = round(nutrition.sugar_g   * factor, 1)
     nutrition.sodium_mg = round(nutrition.sodium_mg * factor, 1)
+    if nutrition.estimated_weight_g:
+        nutrition.estimated_weight_g = round(nutrition.estimated_weight_g * factor, 1)
 
 
 # ── Barcode handler ────────────────────────────────────────────────────────────
@@ -1111,7 +1107,6 @@ def _scale_nutrition(nutrition: "NutritionData", factor: float) -> None:
 async def barcode_photo_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
@@ -1204,12 +1199,13 @@ async def water_amount_handler(
         return WAITING_FOR_WATER
 
     new_total = await log_water(amount, date.today())
-    bar = _progress_bar(new_total, config.DAILY_WATER_GOAL_ML)
-    pct = min(int(new_total / config.DAILY_WATER_GOAL_ML * 100), 100)
-    rem = max(config.DAILY_WATER_GOAL_ML - new_total, 0)
+    water_goal = _get_goal(context.bot_data, "water_ml")
+    bar = _progress_bar(new_total, water_goal)
+    pct = min(int(new_total / water_goal * 100), 100) if water_goal > 0 else 0
+    rem = max(water_goal - new_total, 0)
     await update.message.reply_text(
         f"💧 +{amount}ml logged\n\n"
-        f"{bar} {new_total}ml / {config.DAILY_WATER_GOAL_ML}ml ({pct}%)\n"
+        f"{bar} {new_total}ml / {water_goal}ml ({pct}%)\n"
         f"{rem}ml remaining today"
     )
     return ConversationHandler.END
@@ -1376,12 +1372,13 @@ async def water_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     new_total = await log_water(amount, date.today())
-    bar = _progress_bar(new_total, config.DAILY_WATER_GOAL_ML)
-    pct = min(int(new_total / config.DAILY_WATER_GOAL_ML * 100), 100)
-    rem = max(config.DAILY_WATER_GOAL_ML - new_total, 0)
+    water_goal = _get_goal(context.bot_data, "water_ml")
+    bar = _progress_bar(new_total, water_goal)
+    pct = min(int(new_total / water_goal * 100), 100) if water_goal > 0 else 0
+    rem = max(water_goal - new_total, 0)
     await update.message.reply_text(
         f"Logged {amount} ml of water.\n\n"
-        f"Water\n{bar} {new_total}/{config.DAILY_WATER_GOAL_ML} ml ({pct}%) — {rem} ml left"
+        f"Water\n{bar} {new_total}/{water_goal} ml ({pct}%) — {rem} ml left"
     )
 
 
@@ -1410,7 +1407,6 @@ async def recent_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger = logging.getLogger(__name__)
     query = update.callback_query
     await query.answer()
 
@@ -1445,6 +1441,11 @@ async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             meal_type=meal_type, log_method="Re-log",
         )
         await query.edit_message_text(_build_summary(nutrition, page_url, meal_type))
+        # Increment Times Logged counter in the Saved Meals DB
+        try:
+            await save_to_saved_meals(nutrition, meal_type)
+        except Exception:
+            pass  # Non-critical; don't surface to user
     except Exception:
         logger.exception("Unexpected error in relog_callback")
         await query.edit_message_text("Something went wrong. Please try again.")
@@ -1657,7 +1658,6 @@ async def yesterday_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def copy_yesterday_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    logger = logging.getLogger(__name__)
     query = update.callback_query
     await query.answer()
 
@@ -2010,7 +2010,6 @@ async def template_select_callback(
 async def template_portion_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     query = update.callback_query
     await query.answer()
 
@@ -2075,7 +2074,6 @@ async def template_portion_callback(
 async def template_custom_weight_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    logger = logging.getLogger(__name__)
     meal = context.user_data.get("template_meal")
     if not meal:
         await update.message.reply_text("Session expired. Use /templates again.")
@@ -2150,7 +2148,6 @@ async def template_delete_callback(
     Notion call) and rebuild the keyboard from that cache.
     """
     query = update.callback_query
-    logger = logging.getLogger(__name__)
 
     page_id = query.data[len("del_tpl_"):]
     cache: dict = context.user_data.setdefault("template_meals", {})
@@ -2739,7 +2736,6 @@ async def _maybe_create_weekly_review(app: Application) -> None:
         return
     if not config.NOTION_PARENT_PAGE_ID:
         return
-    logger = logging.getLogger(__name__)
     try:
         week_data = await get_last_week_data()
         if week_data.get("total_entries", 0) == 0:
@@ -2758,7 +2754,6 @@ async def _maybe_create_monthly_review(app: Application) -> None:
         return
     if not config.NOTION_PARENT_PAGE_ID:
         return
-    logger = logging.getLogger(__name__)
     try:
         month_data = await get_last_month_data()
         if month_data.get("total_entries", 0) == 0:
@@ -2798,7 +2793,6 @@ async def _ensure_weight_property() -> None:
 
 def main() -> None:
     setup_logging()
-    logger = logging.getLogger(__name__)
     logger.info("Starting Food Tracker Bot...")
 
     async def post_init(application: Application) -> None:
