@@ -378,8 +378,22 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
         logger.error("Could not extract JSON from Gemini response: %s", raw_text)
         raise RuntimeError("AI returned an unreadable response. Please try again.")
 
+    def _f(val) -> float:
+        """Safely convert any value the AI might return to float."""
+        if val is None:
+            return 0.0
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            # Strip units/symbols (e.g. "450 kcal", "~300", "N/A") and retry
+            cleaned = re.sub(r"[^\d.]", "", str(val))
+            try:
+                return float(cleaned) if cleaned else 0.0
+            except ValueError:
+                return 0.0
+
     # Derive confidence_pct from confidence string if AI didn't return it
-    raw_pct = int(data.get("confidence_pct", 0) or 0)
+    raw_pct = int(_f(data.get("confidence_pct", 0)))
     if raw_pct == 0:
         raw_pct = {"High": 90, "Medium": 68, "Low": 40}.get(
             str(data.get("confidence", "Low")), 0
@@ -393,17 +407,17 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
     return NutritionData(
         food_name=str(data.get("food_name") or "Unknown Food"),
         portion_size=str(data.get("portion_size") or "Unknown"),
-        calories=float(data.get("calories") or 0),
-        protein_g=float(data.get("protein_g") or 0),
-        carbs_g=float(data.get("carbs_g") or 0),
-        fat_g=float(data.get("fat_g") or 0),
-        fiber_g=float(data.get("fiber_g") or 0),
-        sugar_g=float(data.get("sugar_g") or 0),
-        sodium_mg=float(data.get("sodium_mg") or 0),
+        calories=_f(data.get("calories")),
+        protein_g=_f(data.get("protein_g")),
+        carbs_g=_f(data.get("carbs_g")),
+        fat_g=_f(data.get("fat_g")),
+        fiber_g=_f(data.get("fiber_g")),
+        sugar_g=_f(data.get("sugar_g")),
+        sodium_mg=_f(data.get("sodium_mg")),
         confidence=str(data.get("confidence") or "Low"),
         confidence_pct=raw_pct,
         notes=notes,
         recognizable=bool(data.get("recognizable", True)),
         transcription=transcription,
-        estimated_weight_g=float(data.get("estimated_weight_g") or 0),
+        estimated_weight_g=_f(data.get("estimated_weight_g")),
     )

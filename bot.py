@@ -871,6 +871,10 @@ async def serving_type_callback(
     description = context.user_data.get("pending_restaurant_text", "")
     meal_type = context.user_data.get("pending_meal_type", _get_meal_type(context))
 
+    if not description:
+        await query.edit_message_text("Session expired. Please type the meal name again with /log.")
+        return ConversationHandler.END
+
     label = "🍽️ Restaurant-sized" if serving_type == "restaurant" else "🏠 Home-cooked"
     await query.edit_message_text(f"{label} — looking up nutrition...")
 
@@ -927,6 +931,10 @@ async def cooking_context_callback(
     cooking_context = cooking_map.get(query.data, "")
     description = context.user_data.get("pending_ingredients_text", "")
     meal_type = context.user_data.get("pending_meal_type", _get_meal_type(context))
+
+    if not description:
+        await query.edit_message_text("Session expired. Please describe your meal again with /log.")
+        return ConversationHandler.END
 
     label = f"({cooking_context})" if cooking_context else "(no cooking context)"
     await query.edit_message_text(f"Calculating nutrition {label}...")
