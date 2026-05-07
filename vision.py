@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 _model = genai.GenerativeModel(config.GEMINI_MODEL)
-_FALLBACK_MODEL = "gemini-2.0-flash-lite"
+_FALLBACK_MODEL = "gemini-2.5-flash"
 _fallback = genai.GenerativeModel(_FALLBACK_MODEL)
 
 # ── Shared JSON schema rules ───────────────────────────────────────────────────
