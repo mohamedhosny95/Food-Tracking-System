@@ -895,12 +895,14 @@ async def serving_type_callback(
 
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = ""
+        context.user_data["pending_meal_type"] = meal_type
 
+        # Serving type already captures the portion context — go straight to confirm
         await query.edit_message_text(
-            _portion_size_question(nutrition),
-            reply_markup=_portion_size_keyboard(nutrition.estimated_weight_g),
+            _confirmation_preview(nutrition),
+            reply_markup=_confirmation_keyboard(),
         )
-        return CHOOSING_PORTION_SIZE
+        return CONFIRMING_ANALYSIS
 
     except RuntimeError as e:
         logger.error("RuntimeError in serving_type_callback: %s", e)
@@ -952,12 +954,14 @@ async def cooking_context_callback(
 
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = ""
+        context.user_data["pending_meal_type"] = meal_type
 
+        # User already specified exact quantities — skip portion sizing, go straight to confirm
         await query.edit_message_text(
-            _portion_size_question(nutrition),
-            reply_markup=_portion_size_keyboard(nutrition.estimated_weight_g),
+            _confirmation_preview(nutrition),
+            reply_markup=_confirmation_keyboard(),
         )
-        return CHOOSING_PORTION_SIZE
+        return CONFIRMING_ANALYSIS
 
     except RuntimeError as e:
         logger.error("RuntimeError in cooking_context_callback: %s", e)
