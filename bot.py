@@ -289,20 +289,23 @@ async def _log_and_show(
     )
     summary = _build_summary(nutrition, page_url, meal_type)
 
-    # Store for potential "save as frequent meal" or "undo" tap
+    # Store for potential "save as template", "undo", or "log again" tap
     if context is not None:
         context.user_data["last_nutrition"] = nutrition
         context.user_data["last_meal_type"] = meal_type
         context.user_data["last_food_page_id"] = page_id
+        context.user_data["last_photo_url"] = photo_url
+        context.user_data["last_log_method"] = log_method
 
     show_save = bool(config.NOTION_SAVED_MEALS_DB_ID)
-    keyboard_buttons = []
+    top_row = []
     if show_save:
-        keyboard_buttons.append(InlineKeyboardButton("⭐ Save as template", callback_data="save_meal"))
-    keyboard_buttons.append(InlineKeyboardButton("↩ Undo", callback_data="undo_last"))
+        top_row.append(InlineKeyboardButton("⭐ Save as template", callback_data="save_meal"))
+    top_row.append(InlineKeyboardButton("↩ Undo", callback_data="undo_last"))
+    bottom_row = [InlineKeyboardButton("🔁 Log again", callback_data="log_again")]
     await msg.edit_text(
         summary,
-        reply_markup=InlineKeyboardMarkup([keyboard_buttons]),
+        reply_markup=InlineKeyboardMarkup([top_row, bottom_row]),
     )
 
     # Macro suggestion: fire off in background so it arrives ~1s after confirmation
@@ -349,6 +352,30 @@ async def _undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text("↩ Last meal entry deleted.")
     except Exception:
         await query.answer("Could not undo. Try again.", show_alert=True)
+
+
+async def log_again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fires when user taps 🔁 Log again — re-shows the confirmation with current meal type."""
+    query = update.callback_query
+    await query.answer()
+
+    nutrition = context.user_data.get("last_nutrition")
+    if not nutrition:
+        await query.answer("Nothing to re-log.", show_alert=True)
+        return ConversationHandler.END
+
+    meal_type = _get_meal_type(context)
+    context.user_data["pending_nutrition"] = nutrition
+    context.user_data["pending_photo_url"] = context.user_data.get("last_photo_url", "")
+    context.user_data["pending_meal_type"] = meal_type
+    context.user_data["pending_log_method"] = context.user_data.get("last_log_method", "")
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
+    )
+    return CONFIRMING_ANALYSIS
 
 
 # ── /start ─────────────────────────────────────────────────────────────────────
@@ -516,11 +543,20 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             )
             return ConversationHandler.END
 
-        # Store pending data and show confirmation
+        # Store pending data
+        meal_type = _get_meal_type(context)
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = photo_url
-        context.user_data["pending_meal_type"] = _get_meal_type(context)
+        context.user_data["pending_meal_type"] = meal_type
         context.user_data["pending_log_method"] = "Photo"
+
+        # High-confidence photos with a weight estimate go straight to confirmation
+        if nutrition.confidence == "High":
+            await status.edit_text(
+                _confirmation_preview(nutrition, meal_type=meal_type),
+                reply_markup=_confirmation_keyboard(meal_type=meal_type),
+            )
+            return CONFIRMING_ANALYSIS
 
         await status.edit_text(
             _portion_size_question(nutrition),
@@ -531,9 +567,9 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     except RuntimeError as e:
         logger.error("RuntimeError in photo_entry: %s", e)
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in photo_entry")
-        await status.edit_text("An unexpected error occurred. Please try again.")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -715,9 +751,10 @@ async def macro_edit_handler(
     nutrition.fat_g     = round(fat, 1)
     nutrition.notes     = f"Macros manually edited. " + nutrition.notes
 
+    meal_type = context.user_data.get("pending_meal_type", "")
     await update.message.reply_text(
-        _confirmation_preview(nutrition),
-        reply_markup=_confirmation_keyboard(),
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
     )
     return CONFIRMING_ANALYSIS
 
@@ -747,15 +784,26 @@ async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             )
             return ConversationHandler.END
 
+        meal_type = _get_meal_type(context)
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = ""
-        context.user_data["pending_meal_type"] = _get_meal_type(context)
+        context.user_data["pending_meal_type"] = meal_type
         context.user_data["pending_log_method"] = "Voice"
 
         transcript_line = (
             f"I heard: \"{nutrition.transcription}\"\n\n"
             if nutrition.transcription else ""
         )
+
+        # High-confidence voice notes go straight to confirmation
+        if nutrition.confidence == "High":
+            preview = transcript_line + _confirmation_preview(nutrition, meal_type=meal_type)
+            await status.edit_text(
+                preview,
+                reply_markup=_confirmation_keyboard(meal_type=meal_type),
+            )
+            return CONFIRMING_ANALYSIS
+
         await status.edit_text(
             transcript_line + _portion_size_question(nutrition),
             reply_markup=_portion_size_keyboard(nutrition.estimated_weight_g),
@@ -765,16 +813,19 @@ async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     except RuntimeError as e:
         logger.error("RuntimeError in voice_entry: %s", e)
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in voice_entry")
-        await status.edit_text("An unexpected error occurred. Please try again.")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
 # ── Restaurant handler ─────────────────────────────────────────────────────────
 
-def _confirmation_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+_MEAL_TYPE_ICONS = {"Breakfast": "🌅", "Lunch": "☀️", "Snack": "🍎", "Dinner": "🌙"}
+
+
+def _confirmation_keyboard(meal_type: str = "") -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton("✅ Looks right",  callback_data="photo_confirm"),
             InlineKeyboardButton("✏️ Fix name",     callback_data="photo_correct"),
@@ -783,18 +834,23 @@ def _confirmation_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🍽️ I ate X%",    callback_data="photo_portion"),
             InlineKeyboardButton("🔢 Edit macros",  callback_data="photo_edit_macros"),
         ],
-        [
-            InlineKeyboardButton("❌ Cancel",        callback_data="photo_cancel"),
-        ],
-    ])
+    ]
+    if meal_type:
+        icon = _MEAL_TYPE_ICONS.get(meal_type, "🕐")
+        rows.append([InlineKeyboardButton(
+            f"{icon} {meal_type} — tap to change", callback_data="change_meal_type"
+        )])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="photo_cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
-def _confirmation_preview(nutrition: "NutritionData", label: str = "") -> str:
+def _confirmation_preview(nutrition: "NutritionData", label: str = "", meal_type: str = "") -> str:
     conf = _confidence_label(nutrition)
     header = f"I think this is {nutrition.food_name} ({conf})" if not label else label
     source_line = f"\nSource: {nutrition.source}" if nutrition.source else ""
+    meal_line = f"\nMeal: {meal_type}" if meal_type else ""
     return (
-        f"{header}{source_line}\n\n"
+        f"{header}{source_line}{meal_line}\n\n"
         f"Calories:  {nutrition.calories:.0f} kcal\n"
         f"Protein:   {nutrition.protein_g:.1f} g\n"
         f"Carbs:     {nutrition.carbs_g:.1f} g\n"
@@ -833,29 +889,50 @@ async def ingredients_handler(
         await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
 
-    context.user_data["pending_ingredients_text"] = update.message.text.strip()
-    context.user_data["pending_meal_type"] = _get_meal_type(context)
+    # Route template descriptions if the bot was restarted mid-flow
+    if context.user_data.pop("awaiting_template_desc", False):
+        await template_new_description_handler(update, context)
+        return ConversationHandler.END
+
+    description = update.message.text.strip()
+    if not description:
+        await update.message.reply_text("Please describe what you ate.")
+        return ConversationHandler.END
+
+    meal_type = _get_meal_type(context)
+    context.user_data["pending_meal_type"] = meal_type
     context.user_data["pending_log_method"] = "Ingredients"
 
-    await update.message.reply_text(
-        "Got it! Quick context before I calculate — how was this prepared?\n\n"
-        "This helps me get the fat and calorie count right.",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🥩 Raw weight",     callback_data="cook_raw"),
-                InlineKeyboardButton("🍳 Cooked weight",  callback_data="cook_cooked"),
-            ],
-            [
-                InlineKeyboardButton("🔥 Grilled",        callback_data="cook_grilled"),
-                InlineKeyboardButton("🍳 Fried",          callback_data="cook_fried"),
-                InlineKeyboardButton("💧 Boiled/Steamed", callback_data="cook_boiled"),
-            ],
-            [
-                InlineKeyboardButton("⏭️ Skip",           callback_data="cook_skip"),
-            ],
-        ]),
-    )
-    return CHOOSING_COOKING_CONTEXT
+    status = await update.message.reply_text("Calculating nutrition...")
+    try:
+        nutrition = await analyze_food_text(description)
+
+        if not nutrition.recognizable:
+            await status.edit_text(
+                "Could not estimate nutrition from that description.\n\n"
+                f"Notes: {nutrition.notes}\n\n"
+                "Try adding more detail, e.g. quantities and ingredients."
+            )
+            return ConversationHandler.END
+
+        context.user_data["pending_nutrition"] = nutrition
+        context.user_data["pending_photo_url"] = ""
+
+        await status.edit_text(
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
+        )
+        return CONFIRMING_ANALYSIS
+
+    except RuntimeError as e:
+        logger = logging.getLogger(__name__)
+        logger.error("RuntimeError in ingredients_handler: %s", e)
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.exception("Unexpected error in ingredients_handler")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+    return ConversationHandler.END
 
 
 # ── Serving type callback (restaurant: home vs restaurant portion) ─────────────
@@ -870,6 +947,10 @@ async def serving_type_callback(
     serving_type = "restaurant" if query.data == "serve_restaurant" else "home"
     description = context.user_data.get("pending_restaurant_text", "")
     meal_type = context.user_data.get("pending_meal_type", _get_meal_type(context))
+
+    if not description:
+        await query.edit_message_text("Session expired. Please type the meal name again with /log.")
+        return ConversationHandler.END
 
     label = "🍽️ Restaurant-sized" if serving_type == "restaurant" else "🏠 Home-cooked"
     await query.edit_message_text(f"{label} — looking up nutrition...")
@@ -891,19 +972,21 @@ async def serving_type_callback(
 
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = ""
+        context.user_data["pending_meal_type"] = meal_type
 
+        # Serving type already captures the portion context — go straight to confirm
         await query.edit_message_text(
-            _portion_size_question(nutrition),
-            reply_markup=_portion_size_keyboard(nutrition.estimated_weight_g),
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
-        return CHOOSING_PORTION_SIZE
+        return CONFIRMING_ANALYSIS
 
     except RuntimeError as e:
         logger.error("RuntimeError in serving_type_callback: %s", e)
         await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in serving_type_callback")
-        await query.edit_message_text("An unexpected error occurred. Please try again.")
+        await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -928,6 +1011,10 @@ async def cooking_context_callback(
     description = context.user_data.get("pending_ingredients_text", "")
     meal_type = context.user_data.get("pending_meal_type", _get_meal_type(context))
 
+    if not description:
+        await query.edit_message_text("Session expired. Please describe your meal again with /log.")
+        return ConversationHandler.END
+
     label = f"({cooking_context})" if cooking_context else "(no cooking context)"
     await query.edit_message_text(f"Calculating nutrition {label}...")
 
@@ -944,20 +1031,64 @@ async def cooking_context_callback(
 
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = ""
+        context.user_data["pending_meal_type"] = meal_type
 
+        # User already specified exact quantities — skip portion sizing, go straight to confirm
         await query.edit_message_text(
-            _portion_size_question(nutrition),
-            reply_markup=_portion_size_keyboard(nutrition.estimated_weight_g),
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
-        return CHOOSING_PORTION_SIZE
+        return CONFIRMING_ANALYSIS
 
     except RuntimeError as e:
         logger.error("RuntimeError in cooking_context_callback: %s", e)
         await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in cooking_context_callback")
-        await query.edit_message_text("An unexpected error occurred. Please try again.")
+        await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
+
+
+# ── Meal type change callbacks (inside CONFIRMING_ANALYSIS) ────────────────────
+
+async def change_meal_type_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌅 Breakfast", callback_data="set_meal_Breakfast"),
+            InlineKeyboardButton("☀️ Lunch",     callback_data="set_meal_Lunch"),
+        ],
+        [
+            InlineKeyboardButton("🍎 Snack",     callback_data="set_meal_Snack"),
+            InlineKeyboardButton("🌙 Dinner",    callback_data="set_meal_Dinner"),
+        ],
+    ])
+    await query.edit_message_reply_markup(reply_markup=keyboard)
+    return CONFIRMING_ANALYSIS
+
+
+async def meal_type_set_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    meal_type = query.data[len("set_meal_"):]   # "Breakfast", "Lunch", "Snack", or "Dinner"
+    context.user_data["pending_meal_type"] = meal_type
+
+    nutrition = context.user_data.get("pending_nutrition")
+    if not nutrition:
+        await query.edit_message_text("Session expired. Please start again.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
+    )
+    return CONFIRMING_ANALYSIS
 
 
 # ── Portion size selector (photo/voice/restaurant/ingredients) ─────────────────
@@ -1039,9 +1170,10 @@ async def portion_size_callback(
         nutrition.portion_size = f"{size_name} ({label}) of {nutrition.portion_size}"
         nutrition.notes = f"Portion adjusted: {size_name} ({label}). " + nutrition.notes
 
+    meal_type = context.user_data.get("pending_meal_type", "")
     await query.edit_message_text(
-        _confirmation_preview(nutrition),
-        reply_markup=_confirmation_keyboard(),
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
     )
     return CONFIRMING_ANALYSIS
 
@@ -1068,18 +1200,19 @@ async def custom_weight_handler(
         )
         return ENTERING_CUSTOM_WEIGHT
 
+    meal_type = context.user_data.get("pending_meal_type", "")
+
     if nutrition.estimated_weight_g and nutrition.estimated_weight_g > 0:
         factor = user_weight / nutrition.estimated_weight_g
     else:
-        # No reference weight — treat user's input as a direct portion % of estimated macros
-        # Ask them to use the X% button instead
+        # No reference weight — ask user to use the X% button instead
         await update.message.reply_text(
             "I don't have a weight reference for this item. "
             "Please use 🍽️ I ate X% instead to adjust the portion."
         )
         await update.message.reply_text(
-            _confirmation_preview(nutrition),
-            reply_markup=_confirmation_keyboard(),
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
         return CONFIRMING_ANALYSIS
 
@@ -1089,8 +1222,8 @@ async def custom_weight_handler(
     nutrition.estimated_weight_g = user_weight
 
     await update.message.reply_text(
-        _confirmation_preview(nutrition),
-        reply_markup=_confirmation_keyboard(),
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
     )
     return CONFIRMING_ANALYSIS
 
@@ -1153,16 +1286,16 @@ async def barcode_photo_handler(
         context.user_data["pending_log_method"] = "Barcode"
 
         await status.edit_text(
-            _confirmation_preview(nutrition, label=f"Found: {nutrition.food_name}"),
-            reply_markup=_confirmation_keyboard(),
+            _confirmation_preview(nutrition, label=f"Found: {nutrition.food_name}", meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
         return CONFIRMING_ANALYSIS
     except RuntimeError as e:
         logger.error("RuntimeError in barcode_photo_handler: %s", e)
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in barcode_photo_handler")
-        await status.edit_text("An unexpected error occurred. Please try again.")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -1714,6 +1847,53 @@ async def copy_yesterday_callback(
 
 # ── /export ────────────────────────────────────────────────────────────────────
 
+async def testapi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tests each Gemini model and Notion, reports which models work."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    import google.generativeai as genai
+    import config as _cfg
+
+    msg = await update.message.reply_text("Testing all Gemini models + Notion...")
+    lines = []
+
+    candidates = [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-flash-preview-05-20",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+    ]
+    working_model = None
+    for model_name in candidates:
+        try:
+            m = genai.GenerativeModel(model_name)
+            resp = await m.generate_content_async("Reply with just the number 42.")
+            _ = resp.text
+            lines.append(f"✅ {model_name} — works!")
+            if working_model is None:
+                working_model = model_name
+        except Exception as e:
+            short = str(e)[:120]
+            lines.append(f"❌ {model_name} — {short}")
+
+    # Notion
+    try:
+        await get_today_totals(date.today())
+        lines.append("✅ Notion OK")
+    except Exception as e:
+        lines.append(f"❌ Notion FAILED: {e}")
+
+    if working_model:
+        lines.append(f"\nBest working model: {working_model}")
+    else:
+        lines.append("\n⚠️ No Gemini model works — check your API key or enable billing.")
+
+    await msg.edit_text("\n".join(lines))
+
+
 async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
@@ -1921,17 +2101,11 @@ async def weight_nudge_sunday(context) -> None:
 # ── Fallback text ──────────────────────────────────────────────────────────────
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # If the user tapped ➕ Save New Template and then typed their description
-    # but the ConversationHandler state was lost (e.g. bot restarted), route it here.
-    if context.user_data.pop("awaiting_template_desc", False):
-        await template_new_description_handler(update, context)
-        return
-
+    # Fallback for text received while mid-conversation in a state that doesn't handle text.
+    # Plain text outside any conversation is handled by ingredients_handler (entry_point).
     await update.message.reply_text(
-        "Use /log to record a meal — photo, barcode, restaurant, or ingredients.\n\n"
-        "/summary — today's macro progress\n"
-        "/recent  — re-log a saved meal\n"
-        "/water   — log water (e.g. /water 500)"
+        "Please use the buttons above, or send a photo / voice note to log a meal.\n\n"
+        "Type /cancel to exit the current flow, or /log to start fresh."
     )
 
 
@@ -2197,7 +2371,7 @@ async def template_add_new_callback(
     """
     query = update.callback_query
     await query.answer()
-    # Flag so the global text_handler can route the next message if the
+    # Flag so ingredients_handler can route the next message if the
     # ConversationHandler state has been lost (e.g. after a bot restart).
     context.user_data["awaiting_template_desc"] = True
     await query.edit_message_text(
@@ -2860,8 +3034,10 @@ def main() -> None:
             CommandHandler("goals",     goals_handler),
             CallbackQueryHandler(summary_quick_water_callback, pattern="^summary_water$"),
             CallbackQueryHandler(summary_quick_log_callback,   pattern="^summary_log$"),
+            CallbackQueryHandler(log_again_callback,           pattern="^log_again$"),
             MessageHandler(filters.PHOTO, photo_entry),
             MessageHandler(filters.VOICE, voice_entry),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ingredients_handler),
         ],
         states={
             WAITING_FOR_TEXT: [
@@ -2899,6 +3075,8 @@ def main() -> None:
                     photo_confirm_callback,
                     pattern="^photo_(confirm|correct|cancel|portion|edit_macros)$"
                 ),
+                CallbackQueryHandler(change_meal_type_callback, pattern="^change_meal_type$"),
+                CallbackQueryHandler(meal_type_set_callback,    pattern="^set_meal_"),
             ],
             CORRECTING_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, photo_correction_handler),
@@ -2953,6 +3131,7 @@ def main() -> None:
     app.add_handler(CommandHandler("fasting",   fasting_handler))
     app.add_handler(CommandHandler("yesterday", yesterday_handler))
     app.add_handler(CommandHandler("export",    export_handler))
+    app.add_handler(CommandHandler("testapi",   testapi_handler))
     app.add_handler(CommandHandler("chart",     chart_handler))
     app.add_handler(CommandHandler("week",      week_handler))
     app.add_handler(CommandHandler("streak",    streak_handler))
@@ -2971,6 +3150,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(save_meal_callback,        pattern="^save_meal$"))
     app.add_handler(CallbackQueryHandler(_undo_callback,            pattern="^undo_last$"))
     app.add_handler(CallbackQueryHandler(add_restaurant_callback,   pattern="^add_restaurant$"))
+    app.add_handler(CallbackQueryHandler(log_again_callback,        pattern="^log_again$"))
     app.add_handler(CallbackQueryHandler(relog_callback,            pattern="^relog_"))
     app.add_handler(CallbackQueryHandler(copy_yesterday_callback,   pattern="^copy_yday_"))
     app.add_handler(CallbackQueryHandler(export_callback,           pattern="^export_(7|30|month)$"))
