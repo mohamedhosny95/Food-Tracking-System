@@ -533,7 +533,7 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     except Exception as e:
         logger.exception("Unexpected error in photo_entry")
-        await status.edit_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -767,7 +767,7 @@ async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     except Exception as e:
         logger.exception("Unexpected error in voice_entry")
-        await status.edit_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -907,7 +907,7 @@ async def serving_type_callback(
         await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
     except Exception as e:
         logger.exception("Unexpected error in serving_type_callback")
-        await query.edit_message_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
+        await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -964,7 +964,7 @@ async def cooking_context_callback(
         await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
     except Exception as e:
         logger.exception("Unexpected error in cooking_context_callback")
-        await query.edit_message_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
+        await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -1170,7 +1170,7 @@ async def barcode_photo_handler(
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     except Exception as e:
         logger.exception("Unexpected error in barcode_photo_handler")
-        await status.edit_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 

@@ -161,7 +161,11 @@ async def _stream(parts: list) -> str:
 
 async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
     image = PIL.Image.open(io.BytesIO(image_bytes))
-    raw = await _stream([VISION_PROMPT, image])
+    try:
+        raw = await _stream([VISION_PROMPT, image])
+    except Exception as e:
+        logger.error("Gemini API failed in analyze_food_photo: %s", e)
+        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
     logger.debug("Vision response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Photo)"
@@ -169,12 +173,13 @@ async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
 
 
 async def analyze_food_text(description: str, cooking_context: str = "") -> NutritionData:
-    """Analyze a text description of food/ingredients.
-
-    cooking_context: e.g. 'grilled, cooked weight' or 'raw weight, fried'
-    """
+    """Analyze a text description of food/ingredients."""
     suffix = f"\n\nCooking context provided by user: {cooking_context}" if cooking_context else ""
-    raw = await _stream([TEXT_PROMPT + f"\n\nMeal description: {description}{suffix}"])
+    try:
+        raw = await _stream([TEXT_PROMPT + f"\n\nMeal description: {description}{suffix}"])
+    except Exception as e:
+        logger.error("Gemini API failed in analyze_food_text: %s", e)
+        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
     logger.debug("Text response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Ingredients)"
@@ -182,16 +187,17 @@ async def analyze_food_text(description: str, cooking_context: str = "") -> Nutr
 
 
 async def analyze_restaurant_meal(description: str, serving_type: str = "") -> NutritionData:
-    """Analyze a restaurant meal.
-
-    serving_type: 'restaurant' (larger, ~30-50% more) or 'home-cooked' (standard)
-    """
+    """Analyze a restaurant meal."""
     suffix = ""
     if serving_type == "restaurant":
         suffix = "\n\nIMPORTANT: The user confirmed this is a restaurant-sized portion. Restaurant portions are typically 30–50% larger than home-cooked. Adjust your estimates upward accordingly."
     elif serving_type == "home":
         suffix = "\n\nIMPORTANT: The user confirmed this is a home-cooked portion. Use standard home portion sizes, not restaurant sizes."
-    raw = await _stream([RESTAURANT_PROMPT + f"\n\nMeal: {description}{suffix}"])
+    try:
+        raw = await _stream([RESTAURANT_PROMPT + f"\n\nMeal: {description}{suffix}"])
+    except Exception as e:
+        logger.error("Gemini API failed in analyze_restaurant_meal: %s", e)
+        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
     logger.debug("Restaurant response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Restaurant DB)"
@@ -202,7 +208,11 @@ async def analyze_voice_message(audio_bytes: bytes) -> NutritionData:
     """Transcribes a voice note and analyzes the food described in it."""
     audio_b64 = base64.b64encode(audio_bytes).decode()
     audio_part = {"mime_type": "audio/ogg", "data": audio_b64}
-    raw = await _stream([VOICE_PROMPT, audio_part])
+    try:
+        raw = await _stream([VOICE_PROMPT, audio_part])
+    except Exception as e:
+        logger.error("Gemini API failed in analyze_voice_message: %s", e)
+        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
     logger.debug("Voice response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Voice)"
