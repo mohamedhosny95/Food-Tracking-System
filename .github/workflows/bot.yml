@@ -1,6 +1,8 @@
 name: Run Bot
 
 on:
+  push:
+    branches: [main]          # restart immediately on every push to main
   schedule:
     - cron: '0 */5 * * *'   # restart every 5 hours (GitHub jobs max out at 6h)
   workflow_dispatch:          # also allows manual "Run workflow" button
