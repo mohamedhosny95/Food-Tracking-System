@@ -129,6 +129,11 @@ class NutritionData:
 
 # ── Streaming helper ───────────────────────────────────────────────────────────
 
+def _is_quota_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "quota" in msg or "resource has been exhausted" in msg or "rate limit" in msg
+
+
 @retry(
     retry=retry_if_exception_type(Exception),
     stop=stop_after_attempt(3),
@@ -152,6 +157,11 @@ async def _stream(parts: list) -> str:
             except Exception:
                 pass
     except Exception as e:
+        if _is_quota_error(e):
+            raise RuntimeError(
+                "AI quota reached for today. Try again in a few minutes, or check "
+                "your Gemini API project at aistudio.google.com."
+            ) from e
         logger.warning("Gemini API call failed (will retry): %s", e)
         raise
     return raw.strip()

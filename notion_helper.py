@@ -9,12 +9,15 @@ from vision import NutritionData
 
 logger = logging.getLogger(__name__)
 
+# Shared retry policy: 3 attempts, 2→10s exponential backoff
+_retry = retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+
 notion = AsyncClient(auth=config.NOTION_API_KEY)
 
 
 # ── Daily Log ──────────────────────────────────────────────────────────────────
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+@_retry
 async def get_or_create_daily_log(today: date) -> str:
     date_str = today.isoformat()
     response = await notion.databases.query(
@@ -38,7 +41,7 @@ async def get_or_create_daily_log(today: date) -> str:
     return page_id
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+@_retry
 async def get_today_totals(today: date) -> dict:
     date_str = today.isoformat()
     response = await notion.databases.query(
@@ -71,6 +74,7 @@ async def get_today_totals(today: date) -> dict:
     }
 
 
+@_retry
 async def log_water(amount_ml: int, today: date) -> int:
     daily_log_id = await get_or_create_daily_log(today)
     page = await notion.pages.retrieve(page_id=daily_log_id)
@@ -116,7 +120,7 @@ async def get_fasting_status(today: date) -> bool:
 
 # ── Food Entries ───────────────────────────────────────────────────────────────
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+@_retry
 async def create_food_entry(
     nutrition: NutritionData,
     photo_url: str,
@@ -164,12 +168,14 @@ async def create_food_entry(
     return page_url, page_id
 
 
+@_retry
 async def archive_food_entry(page_id: str) -> None:
     """Soft-deletes a food entry by archiving the Notion page."""
     await notion.pages.update(page_id=page_id, archived=True)
     logger.info("Archived food entry %s", page_id)
 
 
+@_retry
 async def get_week_calorie_bank(calorie_goal: int = 0) -> dict:
     """Returns calories consumed vs expected for the current Mon–today window."""
     today = date.today()
@@ -386,6 +392,7 @@ async def ensure_saved_meals_db() -> None:
         logger.error("Failed to create Saved Meals DB: %s", exc)
 
 
+@_retry
 async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> str:
     """Saves a meal to the Saved Meals DB. Returns the page URL."""
     if not config.NOTION_SAVED_MEALS_DB_ID:
@@ -460,7 +467,7 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
     return page_url
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+@_retry
 async def delete_saved_meal(page_id: str) -> None:
     """Archives (soft-deletes) a saved meal template from the Saved Meals DB."""
     if not config.NOTION_SAVED_MEALS_DB_ID:
@@ -469,6 +476,7 @@ async def delete_saved_meal(page_id: str) -> None:
     logger.info("Archived saved meal %s", page_id)
 
 
+@_retry
 async def get_saved_meals(limit: int = 20) -> list[dict]:
     """Returns saved meals sorted by most frequently logged."""
     if not config.NOTION_SAVED_MEALS_DB_ID:
@@ -514,6 +522,7 @@ async def get_saved_meals(limit: int = 20) -> list[dict]:
     return meals
 
 
+@_retry
 async def get_streak() -> int:
     """Returns the number of consecutive days ending today with at least one food entry."""
     today = date.today()
@@ -627,6 +636,7 @@ async def search_restaurants(query: str) -> list[dict]:
     return matches
 
 
+@_retry
 async def add_restaurant(name: str, cuisine: str = "") -> str:
     """Adds a restaurant to the Restaurants DB. Returns the page URL."""
     if not config.NOTION_RESTAURANTS_DB_ID:
@@ -745,6 +755,7 @@ async def create_weekly_review_page(week_data: dict) -> str:
 
 # ── Weight tracking ────────────────────────────────────────────────────────────
 
+@_retry
 async def log_weight(weight_kg: float, today: date) -> None:
     """Saves the user's body weight to today's Daily Log page."""
     daily_log_id = await get_or_create_daily_log(today)
@@ -758,6 +769,7 @@ async def log_weight(weight_kg: float, today: date) -> None:
         logger.warning("Could not save weight (property may not exist yet): %s", e)
 
 
+@_retry
 async def get_recent_weights(limit: int = 8) -> list[dict]:
     """Returns the last `limit` Daily Log entries that have a Weight (kg) logged."""
     response = await notion.databases.query(
@@ -779,6 +791,7 @@ async def get_recent_weights(limit: int = 8) -> list[dict]:
 
 # ── Yesterday's meals ──────────────────────────────────────────────────────────
 
+@_retry
 async def get_yesterday_meals() -> list[dict]:
     """Returns all Food Entries logged yesterday, ordered by creation time."""
     yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -818,6 +831,7 @@ async def get_yesterday_meals() -> list[dict]:
     return meals
 
 
+@_retry
 async def get_recent_food_entries(limit: int = 10) -> list[dict]:
     """Returns the most recently created food entries across all dates."""
     response = await notion.databases.query(
@@ -840,8 +854,34 @@ async def get_recent_food_entries(limit: int = 10) -> list[dict]:
     return entries
 
 
+@_retry
+async def get_today_food_entries(today: date) -> list[dict]:
+    """Returns all food entries logged today, oldest first."""
+    date_str = today.isoformat()
+    response = await notion.databases.query(
+        database_id=config.NOTION_FOOD_DB_ID,
+        filter={"property": "Date", "date": {"equals": date_str}},
+        sorts=[{"timestamp": "created_time", "direction": "ascending"}],
+        page_size=50,
+    )
+    entries = []
+    for page in response["results"]:
+        props = page["properties"]
+        titles = props.get("Name", {}).get("title", [])
+        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
+        entries.append({
+            "page_id": page["id"],
+            "name": name,
+            "calories": float(props.get("Calories", {}).get("number") or 0),
+            "protein_g": float(props.get("Protein (g)", {}).get("number") or 0),
+            "meal_type": (props.get("Meal Type", {}).get("select") or {}).get("name", ""),
+        })
+    return entries
+
+
 # ── Chart data ────────────────────────────────────────────────────────────────
 
+@_retry
 async def get_daily_totals_range(start: date, end: date) -> list[dict]:
     """Return daily calorie/macro totals for every day in [start, end]."""
     response = await notion.databases.query(
