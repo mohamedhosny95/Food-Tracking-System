@@ -531,9 +531,9 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     except RuntimeError as e:
         logger.error("RuntimeError in photo_entry: %s", e)
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in photo_entry")
-        await status.edit_text("An unexpected error occurred. Please try again.")
+        await status.edit_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -765,9 +765,9 @@ async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     except RuntimeError as e:
         logger.error("RuntimeError in voice_entry: %s", e)
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in voice_entry")
-        await status.edit_text("An unexpected error occurred. Please try again.")
+        await status.edit_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -905,9 +905,9 @@ async def serving_type_callback(
     except RuntimeError as e:
         logger.error("RuntimeError in serving_type_callback: %s", e)
         await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in serving_type_callback")
-        await query.edit_message_text("An unexpected error occurred. Please try again.")
+        await query.edit_message_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -962,9 +962,9 @@ async def cooking_context_callback(
     except RuntimeError as e:
         logger.error("RuntimeError in cooking_context_callback: %s", e)
         await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in cooking_context_callback")
-        await query.edit_message_text("An unexpected error occurred. Please try again.")
+        await query.edit_message_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
@@ -1168,9 +1168,9 @@ async def barcode_photo_handler(
     except RuntimeError as e:
         logger.error("RuntimeError in barcode_photo_handler: %s", e)
         await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
-    except Exception:
+    except Exception as e:
         logger.exception("Unexpected error in barcode_photo_handler")
-        await status.edit_text("An unexpected error occurred. Please try again.")
+        await status.edit_text(f"Error ({type(e).__name__}): {e}\n\nPlease try again.")
     return ConversationHandler.END
 
 
