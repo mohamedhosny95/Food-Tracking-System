@@ -1723,25 +1723,48 @@ async def copy_yesterday_callback(
 # ── /export ────────────────────────────────────────────────────────────────────
 
 async def testapi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Quick health check: tests Gemini API and Notion connectivity."""
+    """Tests each Gemini model and Notion, reports which models work."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
-    msg = await update.message.reply_text("Testing API connections...")
+    import google.generativeai as genai
+    import config as _cfg
+
+    msg = await update.message.reply_text("Testing all Gemini models + Notion...")
     lines = []
-    # Test Gemini
+
+    candidates = [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-flash-preview-04-17",
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-pro",
+    ]
+    working_model = None
+    for model_name in candidates:
+        try:
+            m = genai.GenerativeModel(model_name)
+            resp = await m.generate_content_async("Reply with just the number 42.")
+            _ = resp.text
+            lines.append(f"✅ {model_name} — works!")
+            if working_model is None:
+                working_model = model_name
+        except Exception as e:
+            short = str(e)[:120]
+            lines.append(f"❌ {model_name} — {short}")
+
+    # Notion
     try:
-        from vision import analyze_food_text
-        result = await analyze_food_text("100g boiled chicken breast")
-        lines.append(f"✅ Gemini OK — {result.calories:.0f} kcal for test query")
-    except Exception as e:
-        lines.append(f"❌ Gemini FAILED: {type(e).__name__}: {e}")
-    # Test Notion
-    try:
-        totals = await get_today_totals(date.today())
+        await get_today_totals(date.today())
         lines.append("✅ Notion OK")
     except Exception as e:
-        lines.append(f"❌ Notion FAILED: {type(e).__name__}: {e}")
+        lines.append(f"❌ Notion FAILED: {e}")
+
+    if working_model:
+        lines.append(f"\nBest working model: {working_model}")
+    else:
+        lines.append("\n⚠️ No Gemini model works — check your API key or enable billing.")
+
     await msg.edit_text("\n".join(lines))
 
 
