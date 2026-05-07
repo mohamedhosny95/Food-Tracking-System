@@ -1722,6 +1722,29 @@ async def copy_yesterday_callback(
 
 # ── /export ────────────────────────────────────────────────────────────────────
 
+async def testapi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick health check: tests Gemini API and Notion connectivity."""
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Testing API connections...")
+    lines = []
+    # Test Gemini
+    try:
+        from vision import analyze_food_text
+        result = await analyze_food_text("100g boiled chicken breast")
+        lines.append(f"✅ Gemini OK — {result.calories:.0f} kcal for test query")
+    except Exception as e:
+        lines.append(f"❌ Gemini FAILED: {type(e).__name__}: {e}")
+    # Test Notion
+    try:
+        totals = await get_today_totals(date.today())
+        lines.append("✅ Notion OK")
+    except Exception as e:
+        lines.append(f"❌ Notion FAILED: {type(e).__name__}: {e}")
+    await msg.edit_text("\n".join(lines))
+
+
 async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
@@ -2961,6 +2984,7 @@ def main() -> None:
     app.add_handler(CommandHandler("fasting",   fasting_handler))
     app.add_handler(CommandHandler("yesterday", yesterday_handler))
     app.add_handler(CommandHandler("export",    export_handler))
+    app.add_handler(CommandHandler("testapi",   testapi_handler))
     app.add_handler(CommandHandler("chart",     chart_handler))
     app.add_handler(CommandHandler("week",      week_handler))
     app.add_handler(CommandHandler("streak",    streak_handler))

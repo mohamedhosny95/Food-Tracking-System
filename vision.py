@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 
 import PIL.Image
 import google.generativeai as genai
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 import config
 
@@ -17,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 _model = genai.GenerativeModel(config.GEMINI_MODEL)
+_FALLBACK_MODEL = "gemini-1.5-flash"
+_fallback = genai.GenerativeModel(_FALLBACK_MODEL)
 
 # ── Shared JSON schema rules ───────────────────────────────────────────────────
 
@@ -129,43 +130,43 @@ class NutritionData:
 
 # ── Streaming helper ───────────────────────────────────────────────────────────
 
-@retry(
-    retry=retry_if_exception_type(Exception),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-)
-async def _stream(parts: list) -> str:
-    """Call Gemini with streaming and return the full concatenated text."""
+async def _call_model(model, parts: list) -> str:
     raw = ""
-    try:
-        async for chunk in await _model.generate_content_async(
-            parts,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=2048,
-                temperature=0.1,
-            ),
-            stream=True,
-        ):
-            try:
-                raw += chunk.text
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("Gemini API call failed (will retry): %s", e)
-        raise
+    async for chunk in await model.generate_content_async(
+        parts,
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=2048,
+            temperature=0.1,
+        ),
+        stream=True,
+    ):
+        try:
+            raw += chunk.text
+        except Exception:
+            pass
     return raw.strip()
+
+
+async def _stream(parts: list) -> str:
+    """Call Gemini with the primary model, falling back to gemini-1.5-flash on failure."""
+    try:
+        return await _call_model(_model, parts)
+    except Exception as primary_err:
+        logger.warning("Primary model (%s) failed: %s — trying fallback", config.GEMINI_MODEL, primary_err)
+        try:
+            return await _call_model(_fallback, parts)
+        except Exception as fallback_err:
+            logger.error("Fallback model (%s) also failed: %s", _FALLBACK_MODEL, fallback_err)
+            raise RuntimeError(
+                f"AI service unavailable. Primary error: {type(primary_err).__name__}: {primary_err}"
+            ) from primary_err
 
 
 # ── Analysis functions ─────────────────────────────────────────────────────────
 
 async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
     image = PIL.Image.open(io.BytesIO(image_bytes))
-    try:
-        raw = await _stream([VISION_PROMPT, image])
-    except Exception as e:
-        logger.error("Gemini API failed in analyze_food_photo: %s", e)
-        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
+    raw = await _stream([VISION_PROMPT, image])
     logger.debug("Vision response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Photo)"
@@ -175,11 +176,7 @@ async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
 async def analyze_food_text(description: str, cooking_context: str = "") -> NutritionData:
     """Analyze a text description of food/ingredients."""
     suffix = f"\n\nCooking context provided by user: {cooking_context}" if cooking_context else ""
-    try:
-        raw = await _stream([TEXT_PROMPT + f"\n\nMeal description: {description}{suffix}"])
-    except Exception as e:
-        logger.error("Gemini API failed in analyze_food_text: %s", e)
-        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
+    raw = await _stream([TEXT_PROMPT + f"\n\nMeal description: {description}{suffix}"])
     logger.debug("Text response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Ingredients)"
@@ -193,11 +190,7 @@ async def analyze_restaurant_meal(description: str, serving_type: str = "") -> N
         suffix = "\n\nIMPORTANT: The user confirmed this is a restaurant-sized portion. Restaurant portions are typically 30–50% larger than home-cooked. Adjust your estimates upward accordingly."
     elif serving_type == "home":
         suffix = "\n\nIMPORTANT: The user confirmed this is a home-cooked portion. Use standard home portion sizes, not restaurant sizes."
-    try:
-        raw = await _stream([RESTAURANT_PROMPT + f"\n\nMeal: {description}{suffix}"])
-    except Exception as e:
-        logger.error("Gemini API failed in analyze_restaurant_meal: %s", e)
-        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
+    raw = await _stream([RESTAURANT_PROMPT + f"\n\nMeal: {description}{suffix}"])
     logger.debug("Restaurant response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Restaurant DB)"
@@ -208,11 +201,7 @@ async def analyze_voice_message(audio_bytes: bytes) -> NutritionData:
     """Transcribes a voice note and analyzes the food described in it."""
     audio_b64 = base64.b64encode(audio_bytes).decode()
     audio_part = {"mime_type": "audio/ogg", "data": audio_b64}
-    try:
-        raw = await _stream([VOICE_PROMPT, audio_part])
-    except Exception as e:
-        logger.error("Gemini API failed in analyze_voice_message: %s", e)
-        raise RuntimeError(f"AI service error: {type(e).__name__}: {e}") from e
+    raw = await _stream([VOICE_PROMPT, audio_part])
     logger.debug("Voice response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
     nutrition.source = "AI (Voice)"
