@@ -59,6 +59,8 @@ Use this exact schema:
 
 TEXT_PROMPT = f"""You are a professional nutritionist. The user has described a meal or listed ingredients. Calculate the nutritional values and return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
+The user may write in Arabic or English. Understand Arabic food names and ingredient descriptions natively. If the input is in Arabic, set food_name to the English name followed by the Arabic in parentheses — e.g. "Grilled Chicken (دجاج مشوي)". Keep portion_size and notes in English.
+
 Use this exact schema:
 
 {_SCHEMA}
@@ -67,6 +69,8 @@ Use this exact schema:
 - Confidence: High = specific quantities given, Medium = quantities estimated from typical serving, Low = very vague description."""
 
 RESTAURANT_PROMPT = f"""You are a professional nutritionist with access to nutrition databases for major restaurant chains worldwide. The user will tell you a meal name and optionally a restaurant name. Use published nutrition data if you recognise the restaurant; otherwise estimate based on typical preparation.
+
+The user may write in Arabic or English. Understand Arabic restaurant and dish names natively. If the input is in Arabic, set food_name to the English name followed by the Arabic in parentheses — e.g. "Shawarma (شاورما)".
 
 Return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
@@ -78,7 +82,7 @@ Use this exact schema (set food_name to include restaurant e.g. 'Big Mac (McDona
 - Confidence: High = known chain with published data, Medium = recognised dish with estimated portion, Low = unknown restaurant or very ambiguous dish.
 - In notes: state whether you used published data or estimated, and flag if the restaurant is NOT in your knowledge base."""
 
-VOICE_PROMPT = f"""Listen to this voice message. The user is describing food they are eating or have just prepared. First transcribe what they said, then calculate the nutrition.
+VOICE_PROMPT = f"""Listen to this voice message. The user is describing food they are eating or have just prepared. The user may speak in Arabic or English. First transcribe what they said (in their original language), then calculate the nutrition.
 
 Return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
@@ -86,7 +90,7 @@ Use this exact schema:
 
 {{
   "transcription": "string — verbatim transcript of what the user said",
-  "food_name": "string — descriptive name of the food(s) identified",
+  "food_name": "string — descriptive name in English; if Arabic input, add Arabic in parentheses e.g. 'Grilled Chicken (دجاج مشوي)'",
   "portion_size": "string — estimated portion with weight/volume if possible",
   "calories": number,
   "protein_g": number,
