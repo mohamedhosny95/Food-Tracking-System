@@ -1719,6 +1719,21 @@ async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ── /weight ───────────────────────────────────────────────────────────────────
 
+def _weight_trend_per_day(data: list[dict]) -> float | None:
+    """Linear regression over chronological weight data; returns kg/day or None."""
+    if len(data) < 3:
+        return None
+    try:
+        import numpy as np
+        base = date.fromisoformat(data[0]["date"]).toordinal()
+        x = [date.fromisoformat(d["date"]).toordinal() - base for d in data]
+        y = [d["weight_kg"] for d in data]
+        m, _ = np.polyfit(x, y, 1)
+        return float(m)
+    except Exception:
+        return None
+
+
 async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
@@ -1757,17 +1772,39 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "",
             "To update: tell me the new values and I'll apply them.",
         ]
+    # Show goal progress if a target weight is set
+    target = context.bot_data.get("goals", {}).get("target_weight_kg")
+    if target:
+        kg_to_go = target - weight
+        direction = "to go" if target < weight else "to gain"
+        history = await get_recent_weights(8)
+        rate = _weight_trend_per_day(list(reversed(history))) if len(history) >= 3 else None
+        lines += ["", f"Goal: {target:.1f} kg  ({abs(kg_to_go):.1f} kg {direction})"]
+        if rate is not None and abs(rate) > 1e-6:
+            weekly_rate = rate * 7
+            if (rate < 0 and target < weight) or (rate > 0 and target > weight):
+                days_to_goal = max(int(kg_to_go / rate), 0)
+                arrival = date.today() + timedelta(days=days_to_goal)
+                kcal_per_day = abs(weekly_rate) * 7700 / 7
+                lines += [
+                    f"Estimated: {arrival.strftime('%b %d, %Y')}  (~{days_to_goal // 7} weeks)",
+                    f"Pace: {abs(weekly_rate):.2f} kg/week  (~{kcal_per_day:.0f} kcal/day)",
+                ]
+            else:
+                lines.append("Trend is moving away from goal — adjust your intake.")
+
     await update.message.reply_text("\n".join(lines))
 
 
 # ── /weightchart ──────────────────────────────────────────────────────────────
 
-def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
+def _generate_weight_chart(data: list[dict], goal_weight: float | None = None) -> "io.BytesIO":
     import io as _io
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    import numpy as np
     from datetime import date as _date
 
     dates   = [_date.fromisoformat(d["date"]) for d in data]
@@ -1778,7 +1815,7 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
     ax.set_facecolor("#16213e")
 
     ax.plot(dates, weights, color="#4CAF50", linewidth=2.5, marker="o",
-            markersize=7, markerfacecolor="#81C784", zorder=3)
+            markersize=7, markerfacecolor="#81C784", zorder=3, label="Weight")
 
     # Annotate each point with its value
     for d, w in zip(dates, weights):
@@ -1791,9 +1828,18 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
             color="white", fontweight="bold",
         )
 
-    # Trend line (linear regression) when we have enough points
+    # 7-day moving average (blue solid line)
+    if len(weights) >= 3:
+        window = min(7, len(weights))
+        ma = np.convolve(weights, np.ones(window) / window, mode="valid")
+        ax.plot(
+            dates[window - 1:], ma,
+            color="#2196F3", linewidth=2.0, linestyle="-",
+            alpha=0.85, label=f"{window}-day avg", zorder=4,
+        )
+
+    # Linear trend line
     if len(dates) >= 3:
-        import numpy as np
         x_num = mdates.date2num(dates)
         m, b = np.polyfit(x_num, weights, 1)
         ax.plot(
@@ -1802,6 +1848,13 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
             color="#FF9800", linewidth=1.5, linestyle="--",
             alpha=0.7, label="Trend",
             zorder=2,
+        )
+
+    # Goal line
+    if goal_weight is not None:
+        ax.axhline(
+            y=goal_weight, color="#E91E63", linewidth=1.5, linestyle=":",
+            alpha=0.9, label=f"Goal: {goal_weight:.1f} kg", zorder=2,
         )
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
@@ -1817,9 +1870,8 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
         ax.spines[spine].set_color("#444")
     ax.yaxis.grid(True, color="#333", zorder=0)
     ax.set_axisbelow(True)
-    if len(dates) >= 3:
-        ax.legend(loc="upper right", facecolor="#1a1a2e",
-                  labelcolor="white", edgecolor="#444", fontsize=10)
+    ax.legend(loc="upper right", facecolor="#1a1a2e",
+              labelcolor="white", edgecolor="#444", fontsize=10)
 
     fig.tight_layout()
     buf = _io.BytesIO()
@@ -1844,7 +1896,8 @@ async def weightchart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     data = list(reversed(history))   # chronological order for the chart
-    chart_buf = await asyncio.to_thread(_generate_weight_chart, data)
+    goal_weight = context.bot_data.get("goals", {}).get("target_weight_kg")
+    chart_buf = await asyncio.to_thread(_generate_weight_chart, data, goal_weight)
 
     first_w = data[0]["weight_kg"]
     last_w  = data[-1]["weight_kg"]
@@ -1852,14 +1905,87 @@ async def weightchart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     sign    = "+" if delta >= 0 else ""
     weeks   = len(data)
 
+    caption_lines = [
+        f"Weight over last {weeks} weigh-ins",
+        f"Start: {first_w:.1f} kg → Now: {last_w:.1f} kg  ({sign}{delta:.1f} kg)",
+    ]
+    if goal_weight is not None:
+        kg_to_go = goal_weight - last_w
+        direction = "to go" if kg_to_go < 0 else "to gain"
+        caption_lines.append(f"Goal: {goal_weight:.1f} kg  ({abs(kg_to_go):.1f} kg {direction})")
+
     await msg.delete()
     await update.message.reply_photo(
         photo=chart_buf,
-        caption=(
-            f"Weight over last {weeks} weigh-ins\n"
-            f"Start: {first_w:.1f} kg → Now: {last_w:.1f} kg  ({sign}{delta:.1f} kg)"
-        ),
+        caption="\n".join(caption_lines),
     )
+
+
+# ── /goalweight ────────────────────────────────────────────────────────────────
+
+async def goalweight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    if not context.args:
+        target = context.bot_data.get("goals", {}).get("target_weight_kg")
+        if target:
+            await update.message.reply_text(
+                f"Weight goal: {target:.1f} kg\n\n"
+                "To change: /goalweight 80\n"
+                "To clear:  /goalweight clear"
+            )
+        else:
+            await update.message.reply_text("No weight goal set.\n\nUsage: /goalweight 80")
+        return
+
+    if context.args[0].lower() in ("clear", "none", "remove", "delete"):
+        context.bot_data.setdefault("goals", {}).pop("target_weight_kg", None)
+        await update.message.reply_text("Weight goal cleared.")
+        return
+
+    try:
+        target = float(context.args[0].replace("kg", "").strip())
+    except ValueError:
+        await update.message.reply_text("Please enter a number, e.g. /goalweight 80")
+        return
+    if not (30 <= target <= 300):
+        await update.message.reply_text("Please enter a weight between 30 and 300 kg.")
+        return
+
+    context.bot_data.setdefault("goals", {})["target_weight_kg"] = target
+
+    history = await get_recent_weights(8)
+    if len(history) >= 2:
+        data = list(reversed(history))
+        current = data[-1]["weight_kg"]
+        kg_to_go = target - current
+        direction = "lose" if target < current else "gain"
+        lines = [
+            f"Weight goal set: {target:.1f} kg",
+            f"Current: {current:.1f} kg",
+            f"To {direction}: {abs(kg_to_go):.1f} kg",
+        ]
+        rate = _weight_trend_per_day(data)
+        if rate is not None and abs(rate) > 1e-6:
+            weekly_rate = rate * 7
+            if (rate < 0 and target < current) or (rate > 0 and target > current):
+                days_to_goal = max(int(kg_to_go / rate), 0)
+                arrival = date.today() + timedelta(days=days_to_goal)
+                kcal_per_day = abs(weekly_rate) * 7700 / 7
+                lines += [
+                    f"At current pace: {arrival.strftime('%b %d, %Y')}  (~{days_to_goal // 7} weeks)",
+                    f"Rate: {abs(weekly_rate):.2f} kg/week  (~{kcal_per_day:.0f} kcal/day deficit)",
+                ]
+            else:
+                lines.append("Current trend is moving away from your goal — adjust your intake.")
+        await update.message.reply_text("\n".join(lines))
+    else:
+        await update.message.reply_text(
+            f"Weight goal set: {target:.1f} kg\n\n"
+            "Log more weigh-ins with /weight to see an estimated timeline."
+        )
 
 
 # ── /fasting ───────────────────────────────────────────────────────────────────
@@ -3157,6 +3283,7 @@ def main() -> None:
             BotCommand("water",       "Log water (e.g. /water 500)"),
             BotCommand("weight",      "Log your body weight (e.g. /weight 85)"),
             BotCommand("weightchart", "Weight trend chart"),
+            BotCommand("goalweight",  "Set or view target weight goal"),
             BotCommand("goals",       "View or update macro goals"),
             BotCommand("fasting",     "Toggle fasting mode for today"),
             BotCommand("export",      "Export your food log as CSV"),
@@ -3309,6 +3436,7 @@ def main() -> None:
     app.add_handler(CommandHandler("recent",      recent_handler))
     app.add_handler(CommandHandler("weight",      weight_handler))
     app.add_handler(CommandHandler("weightchart", weightchart_handler))
+    app.add_handler(CommandHandler("goalweight",  goalweight_handler))
     app.add_handler(CommandHandler("fasting",     fasting_handler))
     app.add_handler(CommandHandler("yesterday",   yesterday_handler))
     app.add_handler(CommandHandler("export",      export_handler))
