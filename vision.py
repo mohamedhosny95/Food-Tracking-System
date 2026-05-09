@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 import PIL.Image
 import google.generativeai as genai
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 import config
 
@@ -16,8 +17,6 @@ logger = logging.getLogger(__name__)
 
 genai.configure(api_key=config.GEMINI_API_KEY)
 _model = genai.GenerativeModel(config.GEMINI_MODEL)
-_FALLBACK_MODEL = "gemini-2.5-flash"
-_fallback = genai.GenerativeModel(_FALLBACK_MODEL)
 
 # ── Shared JSON schema rules ───────────────────────────────────────────────────
 
@@ -60,6 +59,8 @@ Use this exact schema:
 
 TEXT_PROMPT = f"""You are a professional nutritionist. The user has described a meal or listed ingredients. Calculate the nutritional values and return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
+The user may write in Arabic or English. Understand Arabic food names and ingredient descriptions natively. If the input is in Arabic, set food_name to the English name followed by the Arabic in parentheses — e.g. "Grilled Chicken (دجاج مشوي)". Keep portion_size and notes in English.
+
 Use this exact schema:
 
 {_SCHEMA}
@@ -68,6 +69,8 @@ Use this exact schema:
 - Confidence: High = specific quantities given, Medium = quantities estimated from typical serving, Low = very vague description."""
 
 RESTAURANT_PROMPT = f"""You are a professional nutritionist with access to nutrition databases for major restaurant chains worldwide. The user will tell you a meal name and optionally a restaurant name. Use published nutrition data if you recognise the restaurant; otherwise estimate based on typical preparation.
+
+The user may write in Arabic or English. Understand Arabic restaurant and dish names natively. If the input is in Arabic, set food_name to the English name followed by the Arabic in parentheses — e.g. "Shawarma (شاورما)".
 
 Return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
@@ -79,7 +82,7 @@ Use this exact schema (set food_name to include restaurant e.g. 'Big Mac (McDona
 - Confidence: High = known chain with published data, Medium = recognised dish with estimated portion, Low = unknown restaurant or very ambiguous dish.
 - In notes: state whether you used published data or estimated, and flag if the restaurant is NOT in your knowledge base."""
 
-VOICE_PROMPT = f"""Listen to this voice message. The user is describing food they are eating or have just prepared. First transcribe what they said, then calculate the nutrition.
+VOICE_PROMPT = f"""Listen to this voice message. The user is describing food they are eating or have just prepared. The user may speak in Arabic or English. First transcribe what they said (in their original language), then calculate the nutrition.
 
 Return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
@@ -87,7 +90,7 @@ Use this exact schema:
 
 {{
   "transcription": "string — verbatim transcript of what the user said",
-  "food_name": "string — descriptive name of the food(s) identified",
+  "food_name": "string — descriptive name in English; if Arabic input, add Arabic in parentheses e.g. 'Grilled Chicken (دجاج مشوي)'",
   "portion_size": "string — estimated portion with weight/volume if possible",
   "calories": number,
   "protein_g": number,
@@ -130,36 +133,42 @@ class NutritionData:
 
 # ── Streaming helper ───────────────────────────────────────────────────────────
 
-async def _call_model(model, parts: list) -> str:
-    raw = ""
-    async for chunk in await model.generate_content_async(
-        parts,
-        generation_config=genai.types.GenerationConfig(
-            max_output_tokens=2048,
-            temperature=0.1,
-        ),
-        stream=True,
-    ):
-        try:
-            raw += chunk.text
-        except Exception:
-            pass
-    return raw.strip()
+def _is_quota_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "quota" in msg or "resource has been exhausted" in msg or "rate limit" in msg
 
 
+@retry(
+    retry=retry_if_exception_type(Exception),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
 async def _stream(parts: list) -> str:
-    """Call Gemini with the primary model, falling back to gemini-1.5-flash on failure."""
+    """Call Gemini with streaming and return the full concatenated text."""
+    raw = ""
     try:
-        return await _call_model(_model, parts)
-    except Exception as primary_err:
-        logger.warning("Primary model (%s) failed: %s — trying fallback", config.GEMINI_MODEL, primary_err)
-        try:
-            return await _call_model(_fallback, parts)
-        except Exception as fallback_err:
-            logger.error("Fallback model (%s) also failed: %s", _FALLBACK_MODEL, fallback_err)
+        async for chunk in await _model.generate_content_async(
+            parts,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=2048,
+                temperature=0.1,
+            ),
+            stream=True,
+        ):
+            try:
+                raw += chunk.text
+            except Exception:
+                pass
+    except Exception as e:
+        if _is_quota_error(e):
             raise RuntimeError(
-                f"AI service unavailable. Primary error: {type(primary_err).__name__}: {primary_err}"
-            ) from primary_err
+                "AI quota reached for today. Try again in a few minutes, or check "
+                "your Gemini API project at aistudio.google.com."
+            ) from e
+        logger.warning("Gemini API call failed (will retry): %s", e)
+        raise
+    return raw.strip()
 
 
 # ── Analysis functions ─────────────────────────────────────────────────────────
@@ -174,7 +183,10 @@ async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
 
 
 async def analyze_food_text(description: str, cooking_context: str = "") -> NutritionData:
-    """Analyze a text description of food/ingredients."""
+    """Analyze a text description of food/ingredients.
+
+    cooking_context: e.g. 'grilled, cooked weight' or 'raw weight, fried'
+    """
     suffix = f"\n\nCooking context provided by user: {cooking_context}" if cooking_context else ""
     raw = await _stream([TEXT_PROMPT + f"\n\nMeal description: {description}{suffix}"])
     logger.debug("Text response (%d chars): %s", len(raw), raw)
@@ -184,7 +196,10 @@ async def analyze_food_text(description: str, cooking_context: str = "") -> Nutr
 
 
 async def analyze_restaurant_meal(description: str, serving_type: str = "") -> NutritionData:
-    """Analyze a restaurant meal."""
+    """Analyze a restaurant meal.
+
+    serving_type: 'restaurant' (larger, ~30-50% more) or 'home-cooked' (standard)
+    """
     suffix = ""
     if serving_type == "restaurant":
         suffix = "\n\nIMPORTANT: The user confirmed this is a restaurant-sized portion. Restaurant portions are typically 30–50% larger than home-cooked. Adjust your estimates upward accordingly."
@@ -377,22 +392,8 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
         logger.error("Could not extract JSON from Gemini response: %s", raw_text)
         raise RuntimeError("AI returned an unreadable response. Please try again.")
 
-    def _f(val) -> float:
-        """Safely convert any value the AI might return to float."""
-        if val is None:
-            return 0.0
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            # Strip units/symbols (e.g. "450 kcal", "~300", "N/A") and retry
-            cleaned = re.sub(r"[^\d.]", "", str(val))
-            try:
-                return float(cleaned) if cleaned else 0.0
-            except ValueError:
-                return 0.0
-
     # Derive confidence_pct from confidence string if AI didn't return it
-    raw_pct = int(_f(data.get("confidence_pct", 0)))
+    raw_pct = int(data.get("confidence_pct", 0) or 0)
     if raw_pct == 0:
         raw_pct = {"High": 90, "Medium": 68, "Low": 40}.get(
             str(data.get("confidence", "Low")), 0
@@ -406,17 +407,80 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
     return NutritionData(
         food_name=str(data.get("food_name") or "Unknown Food"),
         portion_size=str(data.get("portion_size") or "Unknown"),
-        calories=_f(data.get("calories")),
-        protein_g=_f(data.get("protein_g")),
-        carbs_g=_f(data.get("carbs_g")),
-        fat_g=_f(data.get("fat_g")),
-        fiber_g=_f(data.get("fiber_g")),
-        sugar_g=_f(data.get("sugar_g")),
-        sodium_mg=_f(data.get("sodium_mg")),
+        calories=float(data.get("calories") or 0),
+        protein_g=float(data.get("protein_g") or 0),
+        carbs_g=float(data.get("carbs_g") or 0),
+        fat_g=float(data.get("fat_g") or 0),
+        fiber_g=float(data.get("fiber_g") or 0),
+        sugar_g=float(data.get("sugar_g") or 0),
+        sodium_mg=float(data.get("sodium_mg") or 0),
         confidence=str(data.get("confidence") or "Low"),
         confidence_pct=raw_pct,
         notes=notes,
         recognizable=bool(data.get("recognizable", True)),
         transcription=transcription,
-        estimated_weight_g=_f(data.get("estimated_weight_g")),
+        estimated_weight_g=float(data.get("estimated_weight_g") or 0),
+    )
+
+
+# ── Workout data ───────────────────────────────────────────────────────────────
+
+WORKOUT_PROMPT = """You are a fitness and exercise expert. Parse this workout description and return ONLY valid JSON — no markdown, no explanation, no code blocks.
+
+The user may write in Arabic or English.
+
+Input: "{description}"
+
+Return exactly this JSON schema:
+{{
+  "exercise": "clean exercise name in English (add Arabic in parentheses if input was Arabic, e.g. 'Bench Press (بنش بريس)')",
+  "workout_type": "Strength" or "Cardio" or "Flexibility" or "Sport",
+  "sets": integer (0 if not applicable),
+  "reps": integer (0 if not applicable),
+  "weight_kg": number (0.0 if not applicable),
+  "duration_min": number (0.0 if not applicable),
+  "distance_km": number (0.0 if not applicable),
+  "calories_burned": integer (estimate; 0 if unknown),
+  "notes": "any extra context or assumptions"
+}}
+
+Parsing rules:
+- "3x10" or "3×10" → sets=3, reps=10
+- "80kg" after exercise name → weight_kg=80
+- Strength (bench press, squats, deadlift, curls, etc.): fill sets/reps/weight_kg; duration/distance = 0
+- Cardio (run, bike, swim, rowing, etc.): fill duration_min, distance_km if mentioned; sets/reps/weight = 0
+- Flexibility (yoga, stretching, pilates): fill duration_min; others = 0
+- Estimate calories_burned: running ~10 kcal/min, cycling ~8, weight training ~6, yoga ~4
+- If no sets/reps mentioned for strength, leave as 0"""
+
+
+@dataclass
+class WorkoutData:
+    exercise: str
+    workout_type: str          # Strength | Cardio | Flexibility | Sport
+    sets: int = 0
+    reps: int = 0
+    weight_kg: float = 0.0
+    duration_min: float = 0.0
+    distance_km: float = 0.0
+    calories_burned: int = 0
+    notes: str = ""
+
+
+async def analyze_workout(description: str) -> WorkoutData:
+    safe = description.replace("{", "{{").replace("}", "}}")
+    prompt = WORKOUT_PROMPT.format(description=safe)
+    raw = await _stream([prompt])
+    raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    data = json.loads(raw)
+    return WorkoutData(
+        exercise=data.get("exercise", description),
+        workout_type=data.get("workout_type", "Strength"),
+        sets=int(data.get("sets") or 0),
+        reps=int(data.get("reps") or 0),
+        weight_kg=float(data.get("weight_kg") or 0),
+        duration_min=float(data.get("duration_min") or 0),
+        distance_km=float(data.get("distance_km") or 0),
+        calories_burned=int(data.get("calories_burned") or 0),
+        notes=data.get("notes", ""),
     )
