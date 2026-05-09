@@ -2361,12 +2361,8 @@ async def weight_nudge_sunday(context) -> None:
 # ── Fallback text ──────────────────────────────────────────────────────────────
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Fallback for text received while mid-conversation in a state that doesn't handle text.
-    # Plain text outside any conversation is handled by ingredients_handler (entry_point).
-    await update.message.reply_text(
-        "Please use the buttons above, or send a photo / voice note to log a meal.\n\n"
-        "Type /cancel to exit the current flow, or /log to start fresh."
-    )
+    # Any plain text that escapes the ConversationHandler is treated as a food description.
+    await ingredients_handler(update, context)
 
 
 # ── /templates ────────────────────────────────────────────────────────────────
@@ -3464,6 +3460,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(relog_callback,            pattern="^relog_"))
     app.add_handler(CallbackQueryHandler(copy_yesterday_callback,   pattern="^copy_yday_"))
     app.add_handler(CallbackQueryHandler(export_callback,           pattern="^export_(7|30|month)$"))
+    # Confirm/cancel the food analysis card when triggered outside the ConversationHandler
+    # (e.g. user typed food text while the bot was in a state that had no text handler)
+    app.add_handler(CallbackQueryHandler(photo_confirm_callback,    pattern="^photo_(confirm|cancel)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
