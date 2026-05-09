@@ -30,6 +30,7 @@ from vision import (
     extract_barcode_number,
     lookup_barcode_product,
     NutritionData,
+    analyze_workout,
 )
 from notion_helper import (
     get_or_create_daily_log,
@@ -58,6 +59,10 @@ from notion_helper import (
     get_last_month_data,
     create_monthly_review_page,
     get_recent_food_entries,
+    get_today_food_entries,
+    log_workout_entry,
+    get_recent_workouts,
+    ensure_workout_db,
 )
 
 
@@ -105,7 +110,9 @@ def is_authorized(user_id: int) -> bool:
     TEMPLATE_ENTERING_WEIGHT,    # templates: typing custom gram weight
     TEMPLATE_SAVING_NEW,         # templates: user typed description, awaiting AI + confirm
     SETTING_GOALS,               # /goals: user typing a new goal value
-) = range(17)
+    WAITING_FOR_WORKOUT_TEXT,    # workout: user typing workout description
+    CONFIRMING_WORKOUT,          # workout: AI result shown, awaiting confirm/cancel
+) = range(19)
 
 
 # ── Goal metadata ──────────────────────────────────────────────────────────────
@@ -289,20 +296,26 @@ async def _log_and_show(
     )
     summary = _build_summary(nutrition, page_url, meal_type)
 
-    # Store for potential "save as frequent meal" or "undo" tap
+    # Store for potential "save as template", "undo", or "log again" tap
     if context is not None:
         context.user_data["last_nutrition"] = nutrition
         context.user_data["last_meal_type"] = meal_type
         context.user_data["last_food_page_id"] = page_id
+        context.user_data["last_photo_url"] = photo_url
+        context.user_data["last_log_method"] = log_method
 
     show_save = bool(config.NOTION_SAVED_MEALS_DB_ID)
-    keyboard_buttons = []
+    top_row = []
     if show_save:
-        keyboard_buttons.append(InlineKeyboardButton("⭐ Save as template", callback_data="save_meal"))
-    keyboard_buttons.append(InlineKeyboardButton("↩ Undo", callback_data="undo_last"))
+        top_row.append(InlineKeyboardButton("⭐ Save as template", callback_data="save_meal"))
+    top_row.append(InlineKeyboardButton("↩ Undo", callback_data="undo_last"))
+    bottom_row = [
+        InlineKeyboardButton("✏️ Edit macros", callback_data="postlog_edit"),
+        InlineKeyboardButton("🔁 Log again",   callback_data="log_again"),
+    ]
     await msg.edit_text(
         summary,
-        reply_markup=InlineKeyboardMarkup([keyboard_buttons]),
+        reply_markup=InlineKeyboardMarkup([top_row, bottom_row]),
     )
 
     # Macro suggestion: fire off in background so it arrives ~1s after confirmation
@@ -351,29 +364,138 @@ async def _undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Could not undo. Try again.", show_alert=True)
 
 
+async def postlog_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fires when user taps ✏️ Edit macros on a just-logged meal — re-enters the edit flow."""
+    query = update.callback_query
+    await query.answer()
+    nutrition = context.user_data.get("last_nutrition")
+    if not nutrition:
+        await query.answer("Session expired.", show_alert=True)
+        return ConversationHandler.END
+    # Load last entry back into pending so CONFIRMING_ANALYSIS handlers work
+    context.user_data["pending_nutrition"] = nutrition
+    context.user_data["pending_photo_url"] = context.user_data.get("last_photo_url", "")
+    context.user_data["pending_meal_type"] = context.user_data.get("last_meal_type", "")
+    context.user_data["pending_log_method"] = context.user_data.get("last_log_method", "")
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        f"Current values:\n"
+        f"  Calories: {nutrition.calories:.0f} kcal\n"
+        f"  Protein:  {nutrition.protein_g:.1f}g\n"
+        f"  Carbs:    {nutrition.carbs_g:.1f}g\n"
+        f"  Fat:      {nutrition.fat_g:.1f}g\n\n"
+        f"Type updated values as: calories protein carbs fat\n"
+        f"Example: 450 35 40 12"
+    )
+    return EDITING_MACROS
+
+
+async def log_again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fires when user taps 🔁 Log again — re-shows the confirmation with current meal type."""
+    query = update.callback_query
+    await query.answer()
+
+    nutrition = context.user_data.get("last_nutrition")
+    if not nutrition:
+        await query.answer("Nothing to re-log.", show_alert=True)
+        return ConversationHandler.END
+
+    meal_type = _get_meal_type(context)
+    context.user_data["pending_nutrition"] = nutrition
+    context.user_data["pending_photo_url"] = context.user_data.get("last_photo_url", "")
+    context.user_data["pending_meal_type"] = meal_type
+    context.user_data["pending_log_method"] = context.user_data.get("last_log_method", "")
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
+    )
+    return CONFIRMING_ANALYSIS
+
+
+# ── Menu keyboard builders ─────────────────────────────────────────────────────
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🍽️ Food",    callback_data="menu_food"),
+        InlineKeyboardButton("💪 Workout", callback_data="menu_workout"),
+    ]])
+
+
+def _food_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Log",        callback_data="menu_food_log"),
+            InlineKeyboardButton("📊 Summary",    callback_data="menu_food_summary"),
+            InlineKeyboardButton("💧 Water",      callback_data="menu_food_water"),
+        ],
+        [
+            InlineKeyboardButton("📅 Today",      callback_data="menu_food_today"),
+            InlineKeyboardButton("📈 Chart",      callback_data="menu_food_chart"),
+            InlineKeyboardButton("🎯 Goals",      callback_data="menu_food_goals"),
+        ],
+        [
+            InlineKeyboardButton("📋 Templates",  callback_data="menu_food_templates"),
+            InlineKeyboardButton("📏 Weight",     callback_data="menu_food_weight"),
+            InlineKeyboardButton("📆 Week",       callback_data="menu_food_week"),
+        ],
+        [InlineKeyboardButton("↩️ Back",           callback_data="menu_main")],
+    ])
+
+
+def _workout_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💪 Log Workout", callback_data="menu_workout_log"),
+            InlineKeyboardButton("📋 History",     callback_data="menu_workout_history"),
+        ],
+        [InlineKeyboardButton("↩️ Back",            callback_data="menu_main")],
+    ])
+
+
 # ── /start ─────────────────────────────────────────────────────────────────────
+
+_HELP_TEXT = (
+    "Commands:\n\n"
+    "Logging\n"
+    "/log         — full log menu (photo, ingredients, restaurant, barcode)\n"
+    "/breakfast, /lunch, /dinner, /snack — quick-log by meal type\n"
+    "/water 500   — log water in ml  (or /w 500)\n"
+    "/weight 85   — log body weight in kg\n"
+    "/today       — all meals logged today\n\n"
+    "Progress\n"
+    "/summary     — today's macros with progress bars\n"
+    "/calories    — quick calorie check\n"
+    "/week        — this week's breakdown\n"
+    "/streak      — logging streak\n"
+    "/history     — last 10 entries\n"
+    "/chart       — 7-day calorie + macro charts\n"
+    "/weightchart — weight trend chart\n\n"
+    "Management\n"
+    "/templates   — saved meal templates\n"
+    "/recent      — re-log a saved meal\n"
+    "/yesterday   — copy yesterday's meals\n"
+    "/delete      — delete a recent entry\n"
+    "/goals       — view / update macro goals\n"
+    "/fasting     — toggle fasting mode\n"
+    "/export      — export CSV\n\n"
+    "Tip: just type what you ate and I'll log it directly."
+)
+
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
         "Food Tracker ready.\n\n"
-        "Send a photo or voice message to log a meal, or use /log.\n\n"
-        "/summary   — today's macro progress\n"
-        "/calories  — quick calorie check\n"
-        "/week      — this week's totals + daily breakdown\n"
-        "/streak    — your current logging streak\n"
-        "/history   — last 10 logged meals\n"
-        "/delete    — delete a recent entry\n"
-        "/recent    — re-log a saved meal\n"
-        "/yesterday — copy yesterday's meals\n"
-        "/templates — manage and quick-log meal templates\n"
-        "/chart     — 7-day calorie trend chart\n"
-        "/goals     — view or update macro goals\n"
-        "/weight    — log your body weight (e.g. /weight 85)\n"
-        "/weightchart — weight trend chart\n"
-        "/fasting   — toggle fasting mode for today\n"
-        "/export    — export your food log as CSV"
+        "Send a photo, voice note, or just type what you ate — I'll handle the rest.\n\n"
+        "/summary to see today's progress  •  /help for all commands",
+        reply_markup=_main_menu_keyboard(),
     )
+
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(_HELP_TEXT)
 
 
 # ── /log conversation ──────────────────────────────────────────────────────────
@@ -414,12 +536,44 @@ def quick_log_handler(meal_type: str):
 
 
 async def summary_quick_water_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Fires when user taps 💧 Log Water on the /summary message."""
+    """Fires when user taps 💧 Log Water on the /summary message — shows preset amounts."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text("How much water? Enter amount in ml (e.g. 250 or 500):")
+    await query.message.reply_text(
+        "How much water?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("💧 250 ml", callback_data="quick_water_250"),
+            InlineKeyboardButton("💧 500 ml", callback_data="quick_water_500"),
+            InlineKeyboardButton("💧 1 L",    callback_data="quick_water_1000"),
+        ], [
+            InlineKeyboardButton("✏️ Other amount", callback_data="quick_water_custom"),
+        ]]),
+    )
     return WAITING_FOR_WATER
+
+
+async def quick_water_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Fires when user taps a preset water button (250/500/1000 ml)."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "quick_water_custom":
+        await query.edit_message_text("How much water? Enter amount in ml (e.g. 250 or 500):")
+        return WAITING_FOR_WATER
+
+    amount = int(query.data.split("_")[-1])
+    new_total = await log_water(amount, date.today())
+    water_goal = config.DAILY_WATER_GOAL_ML
+    bar = _progress_bar(new_total, water_goal)
+    pct = min(int(new_total / water_goal * 100), 100)
+    rem = max(water_goal - new_total, 0)
+    await query.edit_message_text(
+        f"💧 +{amount}ml logged\n\n"
+        f"{bar} {new_total}ml / {water_goal}ml ({pct}%)\n"
+        f"{rem}ml remaining today"
+    )
+    return ConversationHandler.END
 
 
 async def summary_quick_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -516,11 +670,20 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             )
             return ConversationHandler.END
 
-        # Store pending data and show confirmation
+        # Store pending data
+        meal_type = _get_meal_type(context)
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = photo_url
-        context.user_data["pending_meal_type"] = _get_meal_type(context)
+        context.user_data["pending_meal_type"] = meal_type
         context.user_data["pending_log_method"] = "Photo"
+
+        # High-confidence photos with a weight estimate go straight to confirmation
+        if nutrition.confidence == "High":
+            await status.edit_text(
+                _confirmation_preview(nutrition, meal_type=meal_type),
+                reply_markup=_confirmation_keyboard(meal_type=meal_type),
+            )
+            return CONFIRMING_ANALYSIS
 
         await status.edit_text(
             _portion_size_question(nutrition),
@@ -715,9 +878,10 @@ async def macro_edit_handler(
     nutrition.fat_g     = round(fat, 1)
     nutrition.notes     = f"Macros manually edited. " + nutrition.notes
 
+    meal_type = context.user_data.get("pending_meal_type", "")
     await update.message.reply_text(
-        _confirmation_preview(nutrition),
-        reply_markup=_confirmation_keyboard(),
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
     )
     return CONFIRMING_ANALYSIS
 
@@ -747,15 +911,26 @@ async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             )
             return ConversationHandler.END
 
+        meal_type = _get_meal_type(context)
         context.user_data["pending_nutrition"] = nutrition
         context.user_data["pending_photo_url"] = ""
-        context.user_data["pending_meal_type"] = _get_meal_type(context)
+        context.user_data["pending_meal_type"] = meal_type
         context.user_data["pending_log_method"] = "Voice"
 
         transcript_line = (
             f"I heard: \"{nutrition.transcription}\"\n\n"
             if nutrition.transcription else ""
         )
+
+        # High-confidence voice notes go straight to confirmation
+        if nutrition.confidence == "High":
+            preview = transcript_line + _confirmation_preview(nutrition, meal_type=meal_type)
+            await status.edit_text(
+                preview,
+                reply_markup=_confirmation_keyboard(meal_type=meal_type),
+            )
+            return CONFIRMING_ANALYSIS
+
         await status.edit_text(
             transcript_line + _portion_size_question(nutrition),
             reply_markup=_portion_size_keyboard(nutrition.estimated_weight_g),
@@ -773,8 +948,11 @@ async def voice_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 # ── Restaurant handler ─────────────────────────────────────────────────────────
 
-def _confirmation_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+_MEAL_TYPE_ICONS = {"Breakfast": "🌅", "Lunch": "☀️", "Snack": "🍎", "Dinner": "🌙"}
+
+
+def _confirmation_keyboard(meal_type: str = "") -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton("✅ Looks right",  callback_data="photo_confirm"),
             InlineKeyboardButton("✏️ Fix name",     callback_data="photo_correct"),
@@ -783,36 +961,88 @@ def _confirmation_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🍽️ I ate X%",    callback_data="photo_portion"),
             InlineKeyboardButton("🔢 Edit macros",  callback_data="photo_edit_macros"),
         ],
-        [
-            InlineKeyboardButton("❌ Cancel",        callback_data="photo_cancel"),
-        ],
-    ])
+    ]
+    if meal_type:
+        icon = _MEAL_TYPE_ICONS.get(meal_type, "🕐")
+        rows.append([InlineKeyboardButton(
+            f"{icon} {meal_type} — tap to change", callback_data="change_meal_type"
+        )])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="photo_cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
-def _confirmation_preview(nutrition: "NutritionData", label: str = "") -> str:
+def _confirmation_preview(nutrition: "NutritionData", label: str = "", meal_type: str = "") -> str:
     conf = _confidence_label(nutrition)
     header = f"I think this is {nutrition.food_name} ({conf})" if not label else label
     source_line = f"\nSource: {nutrition.source}" if nutrition.source else ""
+    meal_line = f"\nMeal: {meal_type}" if meal_type else ""
     return (
-        f"{header}{source_line}\n\n"
+        f"{header}{source_line}{meal_line}\n\n"
         f"Calories:  {nutrition.calories:.0f} kcal\n"
         f"Protein:   {nutrition.protein_g:.1f} g\n"
         f"Carbs:     {nutrition.carbs_g:.1f} g\n"
-        f"Fat:       {nutrition.fat_g:.1f} g"
+        f"Fat:       {nutrition.fat_g:.1f} g\n"
+        f"Fiber:     {nutrition.fiber_g:.1f} g\n"
+        f"Sugar:     {nutrition.sugar_g:.1f} g\n"
+        f"Sodium:    {nutrition.sodium_mg:.0f} mg"
     )
+
+
+_EXPLICIT_QTY_RE = re.compile(
+    r'\b\d+\s*(?:g|kg|ml|l|oz|cup|cups|tbsp|tsp|piece|pieces|slice|slices|'
+    r'serving|servings|scoop|scoops|handful|plate|bowl|can|bottle|pack)\b',
+    re.IGNORECASE,
+)
+
+
+def _has_explicit_quantities(text: str) -> bool:
+    """Return True when the text contains specific weights/volumes — no need to ask portion size."""
+    return bool(_EXPLICIT_QTY_RE.search(text)) or bool(re.search(r'\b\d+\s*(?:kcal|cal|calories)\b', text, re.IGNORECASE))
 
 
 async def restaurant_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
+    logger = logging.getLogger(__name__)
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
 
     description = update.message.text.strip()
+    meal_type = _get_meal_type(context)
     context.user_data["pending_restaurant_text"] = description
-    context.user_data["pending_meal_type"] = _get_meal_type(context)
+    context.user_data["pending_meal_type"] = meal_type
     context.user_data["pending_log_method"] = "Restaurant"
+
+    # If quantities are already explicit, skip the home/restaurant question
+    if _has_explicit_quantities(description):
+        status = await update.message.reply_text("Looking up nutrition...")
+        try:
+            nutrition = await analyze_restaurant_meal(description, serving_type="")
+            if not nutrition.recognizable:
+                await status.edit_text(
+                    "Could not find nutrition info for that meal.\n\n"
+                    f"Notes: {nutrition.notes}\n\n"
+                    "Try adding more detail, e.g. the restaurant name."
+                )
+                return ConversationHandler.END
+            if nutrition.confidence != "High":
+                context.user_data["last_restaurant_name"] = description
+                context.user_data["show_add_restaurant"] = True
+            context.user_data["pending_nutrition"] = nutrition
+            context.user_data["pending_photo_url"] = ""
+            await status.edit_text(
+                _confirmation_preview(nutrition, meal_type=meal_type),
+                reply_markup=_confirmation_keyboard(meal_type=meal_type),
+            )
+            return CONFIRMING_ANALYSIS
+        except RuntimeError as e:
+            logger.error("RuntimeError in restaurant_handler (explicit qty): %s", e)
+            await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+        except Exception as e:
+            logger.exception("Unexpected error in restaurant_handler (explicit qty)")
+            await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+        return ConversationHandler.END
 
     await update.message.reply_text(
         f"Got it — \"{description}\"\n\nOne quick question:",
@@ -833,29 +1063,50 @@ async def ingredients_handler(
         await update.message.reply_text("Unauthorized.")
         return ConversationHandler.END
 
-    context.user_data["pending_ingredients_text"] = update.message.text.strip()
-    context.user_data["pending_meal_type"] = _get_meal_type(context)
+    # Route template descriptions if the bot was restarted mid-flow
+    if context.user_data.pop("awaiting_template_desc", False):
+        await template_new_description_handler(update, context)
+        return ConversationHandler.END
+
+    description = update.message.text.strip()
+    if not description:
+        await update.message.reply_text("Please describe what you ate.")
+        return ConversationHandler.END
+
+    meal_type = _get_meal_type(context)
+    context.user_data["pending_meal_type"] = meal_type
     context.user_data["pending_log_method"] = "Ingredients"
 
-    await update.message.reply_text(
-        "Got it! Quick context before I calculate — how was this prepared?\n\n"
-        "This helps me get the fat and calorie count right.",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🥩 Raw weight",     callback_data="cook_raw"),
-                InlineKeyboardButton("🍳 Cooked weight",  callback_data="cook_cooked"),
-            ],
-            [
-                InlineKeyboardButton("🔥 Grilled",        callback_data="cook_grilled"),
-                InlineKeyboardButton("🍳 Fried",          callback_data="cook_fried"),
-                InlineKeyboardButton("💧 Boiled/Steamed", callback_data="cook_boiled"),
-            ],
-            [
-                InlineKeyboardButton("⏭️ Skip",           callback_data="cook_skip"),
-            ],
-        ]),
-    )
-    return CHOOSING_COOKING_CONTEXT
+    status = await update.message.reply_text("Calculating nutrition...")
+    try:
+        nutrition = await analyze_food_text(description)
+
+        if not nutrition.recognizable:
+            await status.edit_text(
+                "Could not estimate nutrition from that description.\n\n"
+                f"Notes: {nutrition.notes}\n\n"
+                "Try adding more detail, e.g. quantities and ingredients."
+            )
+            return ConversationHandler.END
+
+        context.user_data["pending_nutrition"] = nutrition
+        context.user_data["pending_photo_url"] = ""
+
+        await status.edit_text(
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
+        )
+        return CONFIRMING_ANALYSIS
+
+    except RuntimeError as e:
+        logger = logging.getLogger(__name__)
+        logger.error("RuntimeError in ingredients_handler: %s", e)
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.exception("Unexpected error in ingredients_handler")
+        await status.edit_text(f"Something went wrong: {e}\n\nPlease try again.")
+    return ConversationHandler.END
 
 
 # ── Serving type callback (restaurant: home vs restaurant portion) ─────────────
@@ -899,8 +1150,8 @@ async def serving_type_callback(
 
         # Serving type already captures the portion context — go straight to confirm
         await query.edit_message_text(
-            _confirmation_preview(nutrition),
-            reply_markup=_confirmation_keyboard(),
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
         return CONFIRMING_ANALYSIS
 
@@ -958,8 +1209,8 @@ async def cooking_context_callback(
 
         # User already specified exact quantities — skip portion sizing, go straight to confirm
         await query.edit_message_text(
-            _confirmation_preview(nutrition),
-            reply_markup=_confirmation_keyboard(),
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
         return CONFIRMING_ANALYSIS
 
@@ -970,6 +1221,48 @@ async def cooking_context_callback(
         logger.exception("Unexpected error in cooking_context_callback")
         await query.edit_message_text(f"Something went wrong: {e}\n\nPlease try again.")
     return ConversationHandler.END
+
+
+# ── Meal type change callbacks (inside CONFIRMING_ANALYSIS) ────────────────────
+
+async def change_meal_type_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌅 Breakfast", callback_data="set_meal_Breakfast"),
+            InlineKeyboardButton("☀️ Lunch",     callback_data="set_meal_Lunch"),
+        ],
+        [
+            InlineKeyboardButton("🍎 Snack",     callback_data="set_meal_Snack"),
+            InlineKeyboardButton("🌙 Dinner",    callback_data="set_meal_Dinner"),
+        ],
+    ])
+    await query.edit_message_reply_markup(reply_markup=keyboard)
+    return CONFIRMING_ANALYSIS
+
+
+async def meal_type_set_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    meal_type = query.data[len("set_meal_"):]   # "Breakfast", "Lunch", "Snack", or "Dinner"
+    context.user_data["pending_meal_type"] = meal_type
+
+    nutrition = context.user_data.get("pending_nutrition")
+    if not nutrition:
+        await query.edit_message_text("Session expired. Please start again.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
+    )
+    return CONFIRMING_ANALYSIS
 
 
 # ── Portion size selector (photo/voice/restaurant/ingredients) ─────────────────
@@ -1051,9 +1344,10 @@ async def portion_size_callback(
         nutrition.portion_size = f"{size_name} ({label}) of {nutrition.portion_size}"
         nutrition.notes = f"Portion adjusted: {size_name} ({label}). " + nutrition.notes
 
+    meal_type = context.user_data.get("pending_meal_type", "")
     await query.edit_message_text(
-        _confirmation_preview(nutrition),
-        reply_markup=_confirmation_keyboard(),
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
     )
     return CONFIRMING_ANALYSIS
 
@@ -1080,18 +1374,19 @@ async def custom_weight_handler(
         )
         return ENTERING_CUSTOM_WEIGHT
 
+    meal_type = context.user_data.get("pending_meal_type", "")
+
     if nutrition.estimated_weight_g and nutrition.estimated_weight_g > 0:
         factor = user_weight / nutrition.estimated_weight_g
     else:
-        # No reference weight — treat user's input as a direct portion % of estimated macros
-        # Ask them to use the X% button instead
+        # No reference weight — ask user to use the X% button instead
         await update.message.reply_text(
             "I don't have a weight reference for this item. "
             "Please use 🍽️ I ate X% instead to adjust the portion."
         )
         await update.message.reply_text(
-            _confirmation_preview(nutrition),
-            reply_markup=_confirmation_keyboard(),
+            _confirmation_preview(nutrition, meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
         return CONFIRMING_ANALYSIS
 
@@ -1101,8 +1396,8 @@ async def custom_weight_handler(
     nutrition.estimated_weight_g = user_weight
 
     await update.message.reply_text(
-        _confirmation_preview(nutrition),
-        reply_markup=_confirmation_keyboard(),
+        _confirmation_preview(nutrition, meal_type=meal_type),
+        reply_markup=_confirmation_keyboard(meal_type=meal_type),
     )
     return CONFIRMING_ANALYSIS
 
@@ -1165,8 +1460,8 @@ async def barcode_photo_handler(
         context.user_data["pending_log_method"] = "Barcode"
 
         await status.edit_text(
-            _confirmation_preview(nutrition, label=f"Found: {nutrition.food_name}"),
-            reply_markup=_confirmation_keyboard(),
+            _confirmation_preview(nutrition, label=f"Found: {nutrition.food_name}", meal_type=meal_type),
+            reply_markup=_confirmation_keyboard(meal_type=meal_type),
         )
         return CONFIRMING_ANALYSIS
     except RuntimeError as e:
@@ -1349,11 +1644,13 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         get_week_calorie_bank(cal_goal),
     )
     if not totals and not fasting:
-        await msg.edit_text("No meals logged today yet. Use /log to add your first meal.")
+        await msg.edit_text(
+            "No meals logged today yet.\n\nJust type what you ate or send a photo to log your first meal.",
+        )
         return
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💧 Log Water", callback_data="summary_water"),
-        InlineKeyboardButton("🍽 Log Meal",  callback_data="summary_log"),
+        InlineKeyboardButton("💧 Water",    callback_data="summary_water"),
+        InlineKeyboardButton("🍽 Log Meal", callback_data="summary_log"),
     ]])
     await msg.edit_text(
         _build_daily_summary(totals or {}, fasting=fasting, bot_data=context.bot_data, streak=streak, week_bank=week_bank),
@@ -1395,6 +1692,11 @@ async def water_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Logged {amount} ml of water.\n\n"
         f"Water\n{bar} {new_total}/{config.DAILY_WATER_GOAL_ML} ml ({pct}%) — {rem} ml left"
     )
+
+
+async def w_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/w alias for /water — accepts /w 500 or /w 500ml."""
+    await water_handler(update, context)
 
 
 # ── /recent ───────────────────────────────────────────────────────────────────
@@ -1464,6 +1766,21 @@ async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ── /weight ───────────────────────────────────────────────────────────────────
 
+def _weight_trend_per_day(data: list[dict]) -> float | None:
+    """Linear regression over chronological weight data; returns kg/day or None."""
+    if len(data) < 3:
+        return None
+    try:
+        import numpy as np
+        base = date.fromisoformat(data[0]["date"]).toordinal()
+        x = [date.fromisoformat(d["date"]).toordinal() - base for d in data]
+        y = [d["weight_kg"] for d in data]
+        m, _ = np.polyfit(x, y, 1)
+        return float(m)
+    except Exception:
+        return None
+
+
 async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
@@ -1502,17 +1819,39 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "",
             "To update: tell me the new values and I'll apply them.",
         ]
+    # Show goal progress if a target weight is set
+    target = context.bot_data.get("goals", {}).get("target_weight_kg")
+    if target:
+        kg_to_go = target - weight
+        direction = "to go" if target < weight else "to gain"
+        history = await get_recent_weights(8)
+        rate = _weight_trend_per_day(list(reversed(history))) if len(history) >= 3 else None
+        lines += ["", f"Goal: {target:.1f} kg  ({abs(kg_to_go):.1f} kg {direction})"]
+        if rate is not None and abs(rate) > 1e-6:
+            weekly_rate = rate * 7
+            if (rate < 0 and target < weight) or (rate > 0 and target > weight):
+                days_to_goal = max(int(kg_to_go / rate), 0)
+                arrival = date.today() + timedelta(days=days_to_goal)
+                kcal_per_day = abs(weekly_rate) * 7700 / 7
+                lines += [
+                    f"Estimated: {arrival.strftime('%b %d, %Y')}  (~{days_to_goal // 7} weeks)",
+                    f"Pace: {abs(weekly_rate):.2f} kg/week  (~{kcal_per_day:.0f} kcal/day)",
+                ]
+            else:
+                lines.append("Trend is moving away from goal — adjust your intake.")
+
     await update.message.reply_text("\n".join(lines))
 
 
 # ── /weightchart ──────────────────────────────────────────────────────────────
 
-def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
+def _generate_weight_chart(data: list[dict], goal_weight: float | None = None) -> "io.BytesIO":
     import io as _io
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    import numpy as np
     from datetime import date as _date
 
     dates   = [_date.fromisoformat(d["date"]) for d in data]
@@ -1523,7 +1862,7 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
     ax.set_facecolor("#16213e")
 
     ax.plot(dates, weights, color="#4CAF50", linewidth=2.5, marker="o",
-            markersize=7, markerfacecolor="#81C784", zorder=3)
+            markersize=7, markerfacecolor="#81C784", zorder=3, label="Weight")
 
     # Annotate each point with its value
     for d, w in zip(dates, weights):
@@ -1536,9 +1875,18 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
             color="white", fontweight="bold",
         )
 
-    # Trend line (linear regression) when we have enough points
+    # 7-day moving average (blue solid line)
+    if len(weights) >= 3:
+        window = min(7, len(weights))
+        ma = np.convolve(weights, np.ones(window) / window, mode="valid")
+        ax.plot(
+            dates[window - 1:], ma,
+            color="#2196F3", linewidth=2.0, linestyle="-",
+            alpha=0.85, label=f"{window}-day avg", zorder=4,
+        )
+
+    # Linear trend line
     if len(dates) >= 3:
-        import numpy as np
         x_num = mdates.date2num(dates)
         m, b = np.polyfit(x_num, weights, 1)
         ax.plot(
@@ -1547,6 +1895,13 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
             color="#FF9800", linewidth=1.5, linestyle="--",
             alpha=0.7, label="Trend",
             zorder=2,
+        )
+
+    # Goal line
+    if goal_weight is not None:
+        ax.axhline(
+            y=goal_weight, color="#E91E63", linewidth=1.5, linestyle=":",
+            alpha=0.9, label=f"Goal: {goal_weight:.1f} kg", zorder=2,
         )
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
@@ -1562,9 +1917,8 @@ def _generate_weight_chart(data: list[dict]) -> "io.BytesIO":
         ax.spines[spine].set_color("#444")
     ax.yaxis.grid(True, color="#333", zorder=0)
     ax.set_axisbelow(True)
-    if len(dates) >= 3:
-        ax.legend(loc="upper right", facecolor="#1a1a2e",
-                  labelcolor="white", edgecolor="#444", fontsize=10)
+    ax.legend(loc="upper right", facecolor="#1a1a2e",
+              labelcolor="white", edgecolor="#444", fontsize=10)
 
     fig.tight_layout()
     buf = _io.BytesIO()
@@ -1589,7 +1943,8 @@ async def weightchart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     data = list(reversed(history))   # chronological order for the chart
-    chart_buf = await asyncio.to_thread(_generate_weight_chart, data)
+    goal_weight = context.bot_data.get("goals", {}).get("target_weight_kg")
+    chart_buf = await asyncio.to_thread(_generate_weight_chart, data, goal_weight)
 
     first_w = data[0]["weight_kg"]
     last_w  = data[-1]["weight_kg"]
@@ -1597,13 +1952,421 @@ async def weightchart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     sign    = "+" if delta >= 0 else ""
     weeks   = len(data)
 
+    caption_lines = [
+        f"Weight over last {weeks} weigh-ins",
+        f"Start: {first_w:.1f} kg → Now: {last_w:.1f} kg  ({sign}{delta:.1f} kg)",
+    ]
+    if goal_weight is not None:
+        kg_to_go = goal_weight - last_w
+        direction = "to go" if kg_to_go < 0 else "to gain"
+        caption_lines.append(f"Goal: {goal_weight:.1f} kg  ({abs(kg_to_go):.1f} kg {direction})")
+
     await msg.delete()
     await update.message.reply_photo(
         photo=chart_buf,
-        caption=(
-            f"Weight over last {weeks} weigh-ins\n"
-            f"Start: {first_w:.1f} kg → Now: {last_w:.1f} kg  ({sign}{delta:.1f} kg)"
-        ),
+        caption="\n".join(caption_lines),
+    )
+
+
+# ── /goalweight ────────────────────────────────────────────────────────────────
+
+async def goalweight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    if not context.args:
+        target = context.bot_data.get("goals", {}).get("target_weight_kg")
+        if target:
+            await update.message.reply_text(
+                f"Weight goal: {target:.1f} kg\n\n"
+                "To change: /goalweight 80\n"
+                "To clear:  /goalweight clear"
+            )
+        else:
+            await update.message.reply_text("No weight goal set.\n\nUsage: /goalweight 80")
+        return
+
+    if context.args[0].lower() in ("clear", "none", "remove", "delete"):
+        context.bot_data.setdefault("goals", {}).pop("target_weight_kg", None)
+        await update.message.reply_text("Weight goal cleared.")
+        return
+
+    try:
+        target = float(context.args[0].replace("kg", "").strip())
+    except ValueError:
+        await update.message.reply_text("Please enter a number, e.g. /goalweight 80")
+        return
+    if not (30 <= target <= 300):
+        await update.message.reply_text("Please enter a weight between 30 and 300 kg.")
+        return
+
+    context.bot_data.setdefault("goals", {})["target_weight_kg"] = target
+
+    history = await get_recent_weights(8)
+    if len(history) >= 2:
+        data = list(reversed(history))
+        current = data[-1]["weight_kg"]
+        kg_to_go = target - current
+        direction = "lose" if target < current else "gain"
+        lines = [
+            f"Weight goal set: {target:.1f} kg",
+            f"Current: {current:.1f} kg",
+            f"To {direction}: {abs(kg_to_go):.1f} kg",
+        ]
+        rate = _weight_trend_per_day(data)
+        if rate is not None and abs(rate) > 1e-6:
+            weekly_rate = rate * 7
+            if (rate < 0 and target < current) or (rate > 0 and target > current):
+                days_to_goal = max(int(kg_to_go / rate), 0)
+                arrival = date.today() + timedelta(days=days_to_goal)
+                kcal_per_day = abs(weekly_rate) * 7700 / 7
+                lines += [
+                    f"At current pace: {arrival.strftime('%b %d, %Y')}  (~{days_to_goal // 7} weeks)",
+                    f"Rate: {abs(weekly_rate):.2f} kg/week  (~{kcal_per_day:.0f} kcal/day deficit)",
+                ]
+            else:
+                lines.append("Current trend is moving away from your goal — adjust your intake.")
+        await update.message.reply_text("\n".join(lines))
+    else:
+        await update.message.reply_text(
+            f"Weight goal set: {target:.1f} kg\n\n"
+            "Log more weigh-ins with /weight to see an estimated timeline."
+        )
+
+
+# ── Menu system handlers ────────────────────────────────────────────────────────
+
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    await update.message.reply_text(
+        "What would you like to track?",
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
+async def menu_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "What would you like to track?",
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
+async def menu_food_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🍽️ Food Mode", reply_markup=_food_menu_keyboard())
+
+
+async def menu_workout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("💪 Workout Mode", reply_markup=_workout_menu_keyboard())
+
+
+# Food menu action callbacks — each starts the right conversation state
+
+async def menu_food_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "What did you eat?\n\nDescribe the meal, send a photo, or record a voice note."
+    )
+    return WAITING_FOR_TEXT
+
+
+async def menu_food_water_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("How much water? (e.g. 500 or 500ml)")
+    return WAITING_FOR_WATER
+
+
+async def menu_food_goals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        _goals_text(context.bot_data),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✏️ Edit a goal", callback_data="goals_edit_menu")
+        ]]),
+    )
+    return SETTING_GOALS
+
+
+async def menu_food_templates_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    # Reuse templates_handler logic — fetch and show templates
+    msg = await query.message.reply_text("Loading templates...")
+    try:
+        meals = await get_saved_meals()
+        context.user_data["template_meals"] = {m["page_id"]: m for m in meals}
+        if not meals:
+            await msg.edit_text(
+                "No templates saved yet.\n\nLog a meal and tap ⭐ Save to create one.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("➕ Save New Template", callback_data="templates_add_new")
+                ]]),
+            )
+        else:
+            await msg.edit_text(
+                f"Your templates ({len(meals)}):",
+                reply_markup=_templates_keyboard(meals),
+            )
+    except Exception as e:
+        await msg.edit_text(f"Could not load templates: {e}")
+        return ConversationHandler.END
+    return TEMPLATE_CHOOSING_PORTION
+
+
+async def menu_food_summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    from notion_helper import get_today_totals as _get_today_totals
+    totals = await _get_today_totals(date.today())
+    cal      = totals.get("calories", 0) if totals else 0
+    protein  = totals.get("protein_g", 0) if totals else 0
+    carbs    = totals.get("carbs_g", 0) if totals else 0
+    fat      = totals.get("fat_g", 0) if totals else 0
+    water    = totals.get("water_ml", 0) if totals else 0
+    cal_goal    = _get_goal(context.bot_data, "calories")
+    protein_goal = _get_goal(context.bot_data, "protein_g")
+    water_goal  = _get_goal(context.bot_data, "water_ml")
+    cal_bar  = _progress_bar(cal, cal_goal)
+    prot_bar = _progress_bar(protein, protein_goal)
+    water_bar = _progress_bar(water, water_goal)
+    lines = [
+        f"📊 Today — {date.today().strftime('%a %b %d')}\n",
+        f"🔥 Calories  {cal_bar} {cal:.0f}/{cal_goal}",
+        f"💪 Protein   {prot_bar} {protein:.0f}/{protein_goal}g",
+        f"🍞 Carbs     {carbs:.0f}g   🥑 Fat {fat:.0f}g",
+        f"💧 Water     {water_bar} {water:.0f}/{water_goal}ml",
+    ]
+    await query.message.reply_text("\n".join(lines))
+
+
+async def menu_food_today_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    entries = await get_today_food_entries(date.today())
+    totals  = await get_today_totals(date.today())
+    if not entries:
+        await query.message.reply_text("Nothing logged today yet. Just describe what you ate to log it!")
+        return
+    lines = [f"Today — {date.today().strftime('%a %b %d')}\n"]
+    for e in entries:
+        tag = f"[{e['meal_type']}] " if e["meal_type"] else ""
+        cal_str  = f"  {e['calories']:.0f} kcal" if e["calories"] else ""
+        prot_str = f"  {e['protein_g']:.0f}g P" if e.get("protein_g") else ""
+        lines.append(f"{tag}{e['name'][:30]}{cal_str}{prot_str}")
+    if totals:
+        lines += [
+            "",
+            f"Total: {totals.get('calories',0):.0f} kcal  |  "
+            f"P {totals.get('protein_g',0):.0f}g  "
+            f"C {totals.get('carbs_g',0):.0f}g  "
+            f"F {totals.get('fat_g',0):.0f}g",
+        ]
+    await query.message.reply_text("\n".join(lines))
+
+
+async def menu_food_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    msg = await query.message.reply_text("Building charts...")
+    today = date.today()
+    data = await get_daily_totals_range(today - timedelta(days=6), today)
+    cal_goal = _get_goal(context.bot_data, "calories")
+    cal_buf, macro_buf = await asyncio.gather(
+        asyncio.to_thread(_generate_calorie_chart, data, cal_goal),
+        asyncio.to_thread(_generate_macro_chart, data),
+    )
+    logged = [d for d in data if d["calories"] > 0]
+    avg = sum(d["calories"] for d in logged) / len(logged) if logged else 0
+    on_goal = sum(1 for d in data if d["calories"] >= cal_goal * 0.9)
+    await msg.delete()
+    await query.message.reply_photo(
+        photo=cal_buf,
+        caption=f"Last 7 days\n📊 Average: {avg:.0f} kcal\n✅ Days on goal: {on_goal}/7",
+    )
+    await query.message.reply_photo(photo=macro_buf)
+
+
+async def menu_food_weight_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("Log your weight with:\n/weight 85\n\nOr see your chart with /weightchart")
+
+
+async def menu_food_week_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    msg = await query.message.reply_text("Fetching week data...")
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    data = await get_daily_totals_range(week_start, today)
+    logged = [d for d in data if d["calories"] > 0]
+    if not logged:
+        await msg.edit_text("No meals logged this week yet.")
+        return
+    cal_goal = _get_goal(context.bot_data, "calories")
+    day_lines = []
+    for d in data:
+        cal = d["calories"]
+        day_name = d["date"].strftime("%a")
+        if cal > 0:
+            filled = min(round(cal / cal_goal * 5), 5) if cal_goal else 0
+            bar = "█" * filled + "░" * (5 - filled)
+            day_lines.append(f"{day_name}  {bar}  {cal:.0f} kcal")
+        else:
+            day_lines.append(f"{day_name}  ░░░░░  —")
+    total_cal  = sum(d["calories"] for d in logged)
+    total_prot = sum(d["protein_g"] for d in logged)
+    avg_cal    = total_cal / len(logged)
+    lines = [
+        f"📅 This week  ({week_start.strftime('%b %d')} – {today.strftime('%b %d')})",
+        "",
+        *day_lines,
+        "",
+        f"Total: {total_cal:.0f} kcal  |  Protein: {total_prot:.0f}g",
+        f"Daily avg: {avg_cal:.0f} kcal  (goal: {cal_goal})",
+    ]
+    await msg.edit_text("\n".join(lines))
+
+
+# ── /workout and workout logging ───────────────────────────────────────────────
+
+async def workout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "💪 Describe your workout:\n\n"
+        "Examples:\n"
+        "• bench press 80kg 3×10\n"
+        "• 30 min run 5km\n"
+        "• deadlift 120kg 5x5\n"
+        "• yoga 45 minutes"
+    )
+    return WAITING_FOR_WORKOUT_TEXT
+
+
+async def menu_workout_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "💪 Describe your workout:\n\n"
+        "Examples:\n"
+        "• bench press 80kg 3×10\n"
+        "• 30 min run 5km\n"
+        "• deadlift 120kg 5x5\n"
+        "• yoga 45 minutes"
+    )
+    return WAITING_FOR_WORKOUT_TEXT
+
+
+async def workout_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    description = update.message.text.strip()
+    msg = await update.message.reply_text("Analyzing workout...")
+    try:
+        workout = await analyze_workout(description)
+    except Exception as e:
+        await msg.edit_text(f"Could not parse workout: {e}\n\nTry again with more detail.")
+        return ConversationHandler.END
+
+    context.user_data["pending_workout"] = workout
+
+    lines = [f"💪 {workout.exercise}", f"Type: {workout.workout_type}"]
+    if workout.sets and workout.reps:
+        weight_str = f" @ {workout.weight_kg:.1f}kg" if workout.weight_kg else ""
+        lines.append(f"Sets × Reps: {workout.sets} × {workout.reps}{weight_str}")
+    elif workout.weight_kg:
+        lines.append(f"Weight: {workout.weight_kg:.1f} kg")
+    if workout.duration_min:
+        lines.append(f"Duration: {workout.duration_min:.0f} min")
+    if workout.distance_km:
+        lines.append(f"Distance: {workout.distance_km:.2f} km")
+    if workout.calories_burned:
+        lines.append(f"~{workout.calories_burned} kcal burned")
+    if workout.notes:
+        lines.append(f"\nNote: {workout.notes}")
+
+    await msg.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Log it", callback_data="workout_confirm"),
+            InlineKeyboardButton("❌ Cancel",  callback_data="workout_cancel"),
+        ]]),
+    )
+    return CONFIRMING_WORKOUT
+
+
+async def workout_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "workout_cancel":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+    workout = context.user_data.pop("pending_workout", None)
+    if not workout:
+        await query.edit_message_text("Session expired. Use /workout to try again.")
+        return ConversationHandler.END
+
+    try:
+        await log_workout_entry(workout, date.today())
+        detail_parts = []
+        if workout.sets and workout.reps:
+            s = f"{workout.sets}×{workout.reps}"
+            if workout.weight_kg:
+                s += f" @ {workout.weight_kg:.1f}kg"
+            detail_parts.append(s)
+        if workout.duration_min:
+            detail_parts.append(f"{workout.duration_min:.0f} min")
+        if workout.distance_km:
+            detail_parts.append(f"{workout.distance_km:.2f} km")
+        detail = "  ".join(detail_parts)
+        await query.edit_message_text(
+            f"✅ {workout.exercise} logged!\n{detail}"
+        )
+    except Exception as e:
+        await query.edit_message_text(f"Failed to log: {e}")
+    return ConversationHandler.END
+
+
+async def menu_workout_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    workouts = await get_recent_workouts(10)
+    if not workouts:
+        await query.edit_message_text(
+            "No workouts logged yet.\n\nTap 💪 Log Workout to add your first one.",
+            reply_markup=_workout_menu_keyboard(),
+        )
+        return
+    lines = ["Recent workouts:\n"]
+    for w in workouts:
+        date_str = w["date"][5:] if w["date"] else "?"
+        if w["sets"] and w["reps"]:
+            detail = f"{w['sets']}×{w['reps']}"
+            if w["weight_kg"]:
+                detail += f" @ {w['weight_kg']:.0f}kg"
+        elif w["duration_min"]:
+            detail = f"{w['duration_min']:.0f}min"
+            if w["distance_km"]:
+                detail += f" / {w['distance_km']:.1f}km"
+        else:
+            detail = w["type"]
+        lines.append(f"{date_str}  {w['exercise'][:22]}  {detail}")
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=_workout_menu_keyboard(),
     )
 
 
@@ -1980,18 +2743,8 @@ async def weight_nudge_sunday(context) -> None:
 # ── Fallback text ──────────────────────────────────────────────────────────────
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # If the user tapped ➕ Save New Template and then typed their description
-    # but the ConversationHandler state was lost (e.g. bot restarted), route it here.
-    if context.user_data.pop("awaiting_template_desc", False):
-        await template_new_description_handler(update, context)
-        return
-
-    await update.message.reply_text(
-        "Use /log to record a meal — photo, barcode, restaurant, or ingredients.\n\n"
-        "/summary — today's macro progress\n"
-        "/recent  — re-log a saved meal\n"
-        "/water   — log water (e.g. /water 500)"
-    )
+    # Any plain text that escapes the ConversationHandler is treated as a food description.
+    await ingredients_handler(update, context)
 
 
 # ── /templates ────────────────────────────────────────────────────────────────
@@ -2256,7 +3009,7 @@ async def template_add_new_callback(
     """
     query = update.callback_query
     await query.answer()
-    # Flag so the global text_handler can route the next message if the
+    # Flag so ingredients_handler can route the next message if the
     # ConversationHandler state has been lost (e.g. after a bot restart).
     context.user_data["awaiting_template_desc"] = True
     await query.edit_message_text(
@@ -2433,6 +3186,33 @@ async def calories_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ── /history ───────────────────────────────────────────────────────────────────
+
+async def today_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+    msg = await update.message.reply_text("Fetching today's meals...")
+    entries = await get_today_food_entries(date.today())
+    totals = await get_today_totals(date.today())
+    if not entries:
+        await msg.edit_text("Nothing logged today yet. Just type what you ate to log it!")
+        return
+    lines = [f"Today — {date.today().strftime('%a %b %d')}\n"]
+    for e in entries:
+        tag = f"[{e['meal_type']}] " if e["meal_type"] else ""
+        cal_str = f"  {e['calories']:.0f} kcal" if e["calories"] else ""
+        prot_str = f"  {e['protein_g']:.0f}g protein" if e.get("protein_g") else ""
+        lines.append(f"{tag}{e['name'][:32]}{cal_str}{prot_str}")
+    if totals:
+        lines += [
+            "",
+            f"Total:  {totals.get('calories', 0):.0f} kcal  |  "
+            f"P {totals.get('protein_g', 0):.0f}g  "
+            f"C {totals.get('carbs_g', 0):.0f}g  "
+            f"F {totals.get('fat_g', 0):.0f}g",
+        ]
+    await msg.edit_text("\n".join(lines))
+
 
 async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
@@ -2862,28 +3642,38 @@ def main() -> None:
 
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([
-            BotCommand("log",       "Log a meal or water"),
-            BotCommand("breakfast", "Quick-log breakfast"),
-            BotCommand("lunch",     "Quick-log lunch"),
-            BotCommand("dinner",    "Quick-log dinner"),
-            BotCommand("snack",     "Quick-log a snack"),
-            BotCommand("summary",   "Today's macro progress"),
-            BotCommand("calories",  "Quick calorie check for today"),
-            BotCommand("week",      "This week's totals and daily breakdown"),
-            BotCommand("streak",    "Your current logging streak"),
-            BotCommand("history",   "Last 10 logged meals"),
-            BotCommand("delete",    "Delete a recent food entry"),
-            BotCommand("recent",    "Re-log a saved meal"),
-            BotCommand("yesterday", "Copy yesterday's meals"),
-            BotCommand("templates", "Manage and quick-log meal templates"),
+            BotCommand("menu",        "Open Food / Workout mode selector"),
+            BotCommand("log",         "Log a meal or water"),
+            BotCommand("breakfast",   "Quick-log breakfast"),
+            BotCommand("lunch",       "Quick-log lunch"),
+            BotCommand("dinner",      "Quick-log dinner"),
+            BotCommand("snack",       "Quick-log a snack"),
+            BotCommand("workout",     "Log a workout session"),
+            BotCommand("summary",     "Today's macro progress"),
+            BotCommand("today",       "All meals logged today"),
+            BotCommand("calories",    "Quick calorie check for today"),
+            BotCommand("week",        "This week's totals and daily breakdown"),
+            BotCommand("streak",      "Your current logging streak"),
+            BotCommand("history",     "Last 10 logged meals"),
+            BotCommand("delete",      "Delete a recent food entry"),
+            BotCommand("recent",      "Re-log a saved meal"),
+            BotCommand("yesterday",   "Copy yesterday's meals"),
+            BotCommand("templates",   "Manage and quick-log meal templates"),
             BotCommand("chart",       "7-day calorie + macro trend charts"),
+            BotCommand("water",       "Log water (e.g. /water 500)"),
             BotCommand("weight",      "Log your body weight (e.g. /weight 85)"),
             BotCommand("weightchart", "Weight trend chart"),
+            BotCommand("goalweight",  "Set or view target weight goal"),
             BotCommand("goals",       "View or update macro goals"),
             BotCommand("fasting",     "Toggle fasting mode for today"),
             BotCommand("export",      "Export your food log as CSV"),
+            BotCommand("help",        "Show all commands"),
         ])
         await ensure_saved_meals_db()
+        try:
+            await ensure_workout_db()
+        except Exception:
+            logging.getLogger(__name__).warning("Could not ensure Workout Log DB on startup")
         await _maybe_create_weekly_review(application)
         await _maybe_create_monthly_review(application)
         await _ensure_weight_property()
@@ -2898,8 +3688,25 @@ def main() -> None:
                 application.bot_data["goals"] = goals
         except Exception:
             pass  # Fall back to config defaults
+        # Notify the owner that the bot is back up
+        chat_id = application.bot_data.get("chat_id")
+        if chat_id:
+            try:
+                await application.bot.send_message(chat_id=chat_id, text="Bot restarted ✓")
+            except Exception:
+                pass  # Don't let this block startup
 
-    persistence = PicklePersistence(filepath="bot_state.pkl")
+    # Graceful pickle corruption recovery — if state file is corrupt, delete and restart fresh
+    _PICKLE_PATH = "bot_state.pkl"
+    try:
+        persistence = PicklePersistence(filepath=_PICKLE_PATH)
+    except Exception as _pkl_err:
+        logger.warning("bot_state.pkl appears corrupt (%s) — deleting and starting fresh", _pkl_err)
+        try:
+            os.remove(_PICKLE_PATH)
+        except FileNotFoundError:
+            pass
+        persistence = PicklePersistence(filepath=_PICKLE_PATH)
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
@@ -2917,10 +3724,20 @@ def main() -> None:
             CommandHandler("snack",     quick_log_handler("Snack")),
             CommandHandler("templates", templates_handler),
             CommandHandler("goals",     goals_handler),
+            CommandHandler("workout",   workout_handler),
+            CommandHandler("menu",      menu_handler),
             CallbackQueryHandler(summary_quick_water_callback, pattern="^summary_water$"),
             CallbackQueryHandler(summary_quick_log_callback,   pattern="^summary_log$"),
+            CallbackQueryHandler(log_again_callback,        pattern="^log_again$"),
+            CallbackQueryHandler(postlog_edit_callback,     pattern="^postlog_edit$"),
+            CallbackQueryHandler(menu_food_log_callback,       pattern="^menu_food_log$"),
+            CallbackQueryHandler(menu_food_water_callback,     pattern="^menu_food_water$"),
+            CallbackQueryHandler(menu_food_goals_callback,     pattern="^menu_food_goals$"),
+            CallbackQueryHandler(menu_food_templates_callback, pattern="^menu_food_templates$"),
+            CallbackQueryHandler(menu_workout_log_callback,    pattern="^menu_workout_log$"),
             MessageHandler(filters.PHOTO, photo_entry),
             MessageHandler(filters.VOICE, voice_entry),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ingredients_handler),
         ],
         states={
             WAITING_FOR_TEXT: [
@@ -2941,12 +3758,6 @@ def main() -> None:
             CHOOSING_SERVING_TYPE: [
                 CallbackQueryHandler(serving_type_callback, pattern="^serve_(home|restaurant)$"),
             ],
-            CHOOSING_COOKING_CONTEXT: [
-                CallbackQueryHandler(
-                    cooking_context_callback,
-                    pattern="^cook_(raw|cooked|grilled|fried|boiled|skip)$"
-                ),
-            ],
             CHOOSING_PORTION_SIZE: [
                 CallbackQueryHandler(portion_size_callback, pattern="^psize_(small|medium|large|custom)$"),
             ],
@@ -2958,6 +3769,8 @@ def main() -> None:
                     photo_confirm_callback,
                     pattern="^photo_(confirm|correct|cancel|portion|edit_macros)$"
                 ),
+                CallbackQueryHandler(change_meal_type_callback, pattern="^change_meal_type$"),
+                CallbackQueryHandler(meal_type_set_callback,    pattern="^set_meal_"),
             ],
             CORRECTING_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, photo_correction_handler),
@@ -2969,6 +3782,7 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, macro_edit_handler),
             ],
             WAITING_FOR_WATER: [
+                CallbackQueryHandler(quick_water_preset_callback, pattern="^quick_water_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, water_amount_handler),
             ],
             WAITING_FOR_WEIGHT_INPUT: [
@@ -2994,31 +3808,54 @@ def main() -> None:
                 CallbackQueryHandler(goals_pick_callback,      pattern="^goal_set_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, goals_input_handler),
             ],
+            WAITING_FOR_WORKOUT_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, workout_text_handler),
+            ],
+            CONFIRMING_WORKOUT: [
+                CallbackQueryHandler(workout_confirm_callback, pattern="^workout_(confirm|cancel)$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_handler)],
         per_message=False,
         allow_reentry=True,
+        conversation_timeout=900,   # 15 minutes — auto-cancel stale flows
         name="food_conv",
         persistent=True,
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("start",     start_handler))
-    app.add_handler(CommandHandler("summary",   summary_handler))
-    app.add_handler(CommandHandler("water",     water_handler))
-    app.add_handler(CommandHandler("recent",    recent_handler))
+    app.add_handler(CommandHandler("menu",    menu_handler))
+    app.add_handler(CommandHandler("workout", workout_handler))
+    app.add_handler(CallbackQueryHandler(menu_main_callback,             pattern="^menu_main$"))
+    app.add_handler(CallbackQueryHandler(menu_food_callback,             pattern="^menu_food$"))
+    app.add_handler(CallbackQueryHandler(menu_workout_callback,          pattern="^menu_workout$"))
+    app.add_handler(CallbackQueryHandler(menu_food_summary_callback,     pattern="^menu_food_summary$"))
+    app.add_handler(CallbackQueryHandler(menu_food_today_callback,       pattern="^menu_food_today$"))
+    app.add_handler(CallbackQueryHandler(menu_food_chart_callback,       pattern="^menu_food_chart$"))
+    app.add_handler(CallbackQueryHandler(menu_food_weight_callback,      pattern="^menu_food_weight$"))
+    app.add_handler(CallbackQueryHandler(menu_food_week_callback,        pattern="^menu_food_week$"))
+    app.add_handler(CallbackQueryHandler(menu_workout_history_callback,  pattern="^menu_workout_history$"))
+    app.add_handler(CallbackQueryHandler(workout_confirm_callback,       pattern="^workout_(confirm|cancel)$"))
+    app.add_handler(CommandHandler("start",       start_handler))
+    app.add_handler(CommandHandler("help",        help_handler))
+    app.add_handler(CommandHandler("summary",     summary_handler))
+    app.add_handler(CommandHandler("water",       water_handler))
+    app.add_handler(CommandHandler("w",           w_handler))
+    app.add_handler(CommandHandler("today",       today_handler))
+    app.add_handler(CommandHandler("recent",      recent_handler))
     app.add_handler(CommandHandler("weight",      weight_handler))
     app.add_handler(CommandHandler("weightchart", weightchart_handler))
-    app.add_handler(CommandHandler("fasting",   fasting_handler))
-    app.add_handler(CommandHandler("yesterday", yesterday_handler))
-    app.add_handler(CommandHandler("export",    export_handler))
-    app.add_handler(CommandHandler("testapi",   testapi_handler))
-    app.add_handler(CommandHandler("chart",     chart_handler))
-    app.add_handler(CommandHandler("week",      week_handler))
-    app.add_handler(CommandHandler("streak",    streak_handler))
-    app.add_handler(CommandHandler("calories",  calories_handler))
-    app.add_handler(CommandHandler("history",   history_handler))
-    app.add_handler(CommandHandler("delete",    delete_handler))
+    app.add_handler(CommandHandler("goalweight",  goalweight_handler))
+    app.add_handler(CommandHandler("fasting",     fasting_handler))
+    app.add_handler(CommandHandler("yesterday",   yesterday_handler))
+    app.add_handler(CommandHandler("export",      export_handler))
+    app.add_handler(CommandHandler("testapi",     testapi_handler))
+    app.add_handler(CommandHandler("chart",       chart_handler))
+    app.add_handler(CommandHandler("week",        week_handler))
+    app.add_handler(CommandHandler("streak",      streak_handler))
+    app.add_handler(CommandHandler("calories",    calories_handler))
+    app.add_handler(CommandHandler("history",     history_handler))
+    app.add_handler(CommandHandler("delete",      delete_handler))
     app.add_handler(CallbackQueryHandler(delete_entry_callback, pattern="^del_entry_"))
     # Goals callbacks that appear outside the conversation (e.g. "Edit another" tap)
     app.add_handler(CallbackQueryHandler(goals_edit_menu_callback, pattern="^goals_edit_menu$"))
@@ -3030,10 +3867,15 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(template_delete_callback,      pattern="^del_tpl_"))
     app.add_handler(CallbackQueryHandler(save_meal_callback,        pattern="^save_meal$"))
     app.add_handler(CallbackQueryHandler(_undo_callback,            pattern="^undo_last$"))
+    app.add_handler(CallbackQueryHandler(postlog_edit_callback,     pattern="^postlog_edit$"))
     app.add_handler(CallbackQueryHandler(add_restaurant_callback,   pattern="^add_restaurant$"))
+    app.add_handler(CallbackQueryHandler(log_again_callback,        pattern="^log_again$"))
     app.add_handler(CallbackQueryHandler(relog_callback,            pattern="^relog_"))
     app.add_handler(CallbackQueryHandler(copy_yesterday_callback,   pattern="^copy_yday_"))
     app.add_handler(CallbackQueryHandler(export_callback,           pattern="^export_(7|30|month)$"))
+    # Confirm/cancel the food analysis card when triggered outside the ConversationHandler
+    # (e.g. user typed food text while the bot was in a state that had no text handler)
+    app.add_handler(CallbackQueryHandler(photo_confirm_callback,    pattern="^photo_(confirm|cancel)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
