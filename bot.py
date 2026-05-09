@@ -2742,8 +2742,20 @@ async def weight_nudge_sunday(context) -> None:
 
 # ── Fallback text ──────────────────────────────────────────────────────────────
 
+_WORKOUT_RE = re.compile(
+    r'\b(?:bench\s*press|squat|deadlift|pull.?up|push.?up|curl|row|press|lunge|dip|plank|'
+    r'run|jog|sprint|cycling|bike|swim|yoga|pilates|stretch|'
+    r'workout|exercise|sets?|reps?|'
+    r'\d+\s*[x×]\s*\d+)\b',
+    re.IGNORECASE,
+)
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Any plain text that escapes the ConversationHandler is treated as a food description.
+    text = (update.message.text or "").strip()
+    if _WORKOUT_RE.search(text):
+        await workout_text_handler(update, context)
+        return
     await ingredients_handler(update, context)
 
 
