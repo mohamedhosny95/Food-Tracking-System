@@ -17,6 +17,7 @@ NOTION_FOOD_DB_ID: str = os.environ["NOTION_FOOD_DB_ID"]
 NOTION_DAILY_DB_ID: str = os.environ["NOTION_DAILY_DB_ID"]
 NOTION_RESTAURANTS_DB_ID: str = os.getenv("NOTION_RESTAURANTS_DB_ID", "")
 NOTION_SAVED_MEALS_DB_ID: str = os.getenv("NOTION_SAVED_MEALS_DB_ID", "")
+NOTION_WORKOUT_DB_ID: str = os.getenv("NOTION_WORKOUT_DB_ID", "")
 NOTION_PARENT_PAGE_ID: str = os.getenv("NOTION_PARENT_PAGE_ID", "")
 
 # Daily macro & hydration goals (used by /summary)
