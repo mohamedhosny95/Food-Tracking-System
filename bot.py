@@ -2751,12 +2751,11 @@ _WORKOUT_RE = re.compile(
 )
 
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
     if _WORKOUT_RE.search(text):
-        await workout_text_handler(update, context)
-        return
-    await ingredients_handler(update, context)
+        return await workout_text_handler(update, context)
+    return await ingredients_handler(update, context)
 
 
 # ── /templates ────────────────────────────────────────────────────────────────
@@ -3749,7 +3748,7 @@ def main() -> None:
             CallbackQueryHandler(menu_workout_log_callback,    pattern="^menu_workout_log$"),
             MessageHandler(filters.PHOTO, photo_entry),
             MessageHandler(filters.VOICE, voice_entry),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, ingredients_handler),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler),
         ],
         states={
             WAITING_FOR_TEXT: [
