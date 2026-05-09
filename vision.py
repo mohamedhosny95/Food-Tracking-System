@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 genai.configure(api_key=config.GEMINI_API_KEY)
 _model = genai.GenerativeModel(config.GEMINI_MODEL)
 
-# ── Shared JSON schema rules ───────────────────────────────────────────────────
+# ── Shared JSON schema rules ───────────────────────────────────────────────
 
 _SCHEMA = """{
   "food_name": "string — descriptive name of the food(s)",
@@ -45,7 +45,7 @@ _RULES = """Rules:
 - confidence_pct: 85–100 = High confidence, 55–80 = Medium, 0–50 = Low. Return a specific integer.
 - Do not include units in numeric fields."""
 
-# ── Prompts ────────────────────────────────────────────────────────────────────
+# ── Prompts ────────────────────────────────────────────────────────────────
 
 VISION_PROMPT = f"""You are a professional nutritionist and food analyst. Analyze the food in this image and return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
@@ -74,7 +74,7 @@ The user may write in Arabic or English. Understand Arabic restaurant and dish n
 
 Return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
-Use this exact schema (set food_name to include restaurant e.g. 'Big Mac (McDonald's)'):
+Use this exact schema (set food_name to include restaurant e.g. 'Big Mac (McDonald\'s)'):
 
 {_SCHEMA}
 
@@ -109,7 +109,7 @@ Use this exact schema:
 - Confidence: High = specific quantities clearly stated, Medium = food identified but quantities estimated, Low = audio unclear or food ambiguous."""
 
 
-# ── Data class ─────────────────────────────────────────────────────────────────
+# ── Data class ────────────────────────────────────────────────────────────────
 
 @dataclass
 class NutritionData:
@@ -171,7 +171,7 @@ async def _stream(parts: list) -> str:
     return raw.strip()
 
 
-# ── Analysis functions ─────────────────────────────────────────────────────────
+# ── Analysis functions ──────────────────────────────────────────────────────────
 
 async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
     image = PIL.Image.open(io.BytesIO(image_bytes))
@@ -223,7 +223,7 @@ async def analyze_voice_message(audio_bytes: bytes) -> NutritionData:
     return nutrition
 
 
-# ── Barcode scanning ──────────────────────────────────────────────────────────
+# ── Barcode scanning ───────────────────────────────────────────────────────────
 
 _BARCODE_PROMPT = (
     "Look at this image. If there is a barcode (EAN-13, UPC-A, UPC-E, QR code, etc.) "
@@ -314,7 +314,7 @@ async def lookup_barcode_product(barcode: str) -> NutritionData | None:
     )
 
 
-# ── JSON parsing ───────────────────────────────────────────────────────────────
+# ── JSON parsing ─────────────────────────────────────────────────────────────────
 
 def _scrape_fields(text: str) -> dict | None:
     num = r"(\d+(?:\.\d*)?)"
