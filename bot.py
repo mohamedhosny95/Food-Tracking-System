@@ -2280,6 +2280,7 @@ async def workout_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     context.user_data["pending_workout"] = workout
+    context.user_data["pending_workout_text"] = description
 
     lines = [f"💪 {workout.exercise}", f"Type: {workout.workout_type}"]
     if workout.sets and workout.reps:
@@ -2316,8 +2317,16 @@ async def workout_confirm_callback(update: Update, context: ContextTypes.DEFAULT
 
     workout = context.user_data.pop("pending_workout", None)
     if not workout:
-        await query.edit_message_text("Session expired. Use /workout to try again.")
-        return ConversationHandler.END
+        description = context.user_data.pop("pending_workout_text", None)
+        if not description:
+            await query.edit_message_text("Session expired. Please describe the workout again.")
+            return ConversationHandler.END
+        await query.edit_message_text("Re-analyzing workout...")
+        try:
+            workout = await analyze_workout(description)
+        except Exception as e:
+            await query.edit_message_text(f"Could not re-analyze: {e}\n\nPlease describe the workout again.")
+            return ConversationHandler.END
 
     try:
         await log_workout_entry(workout, date.today())
