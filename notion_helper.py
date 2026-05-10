@@ -138,7 +138,7 @@ async def ensure_notion_schema() -> None:
     except Exception:
         logger.exception("Could not add basic Food Entries columns")
 
-    # ── Step 2: Food → Daily Log relation ───────────────────────────────────────
+    # ── Step 2: Food → Daily Log relation ───────────────────────────────────
     try:
         food_schema = await _get_food_db_props()
         if "Daily Log" not in food_schema:
@@ -158,7 +158,7 @@ async def ensure_notion_schema() -> None:
     except Exception:
         logger.warning("Could not add Daily Log relation (non-fatal, food logging still works)")
 
-    # ── Step 3: Basic Daily Log columns ──────────────────────────────────────────
+    # ── Step 3: Basic Daily Log columns ──────────────────────────────────
     try:
         daily_schema = await _get_daily_db_props()
         basic_daily = _missing_props(daily_schema, {
@@ -180,7 +180,7 @@ async def ensure_notion_schema() -> None:
     except Exception:
         logger.exception("Could not add basic Daily Log columns")
 
-    # ── Step 4: Rollup columns (requires relation to already exist) ─────────────
+    # ── Step 4: Rollup columns (requires relation to already exist) ───────────
     try:
         food_schema = await _get_food_db_props()
         daily_schema = await _get_daily_db_props(refresh=True)
@@ -229,7 +229,7 @@ async def ensure_notion_schema() -> None:
         logger.warning("Could not add rollup columns (non-fatal, summaries may show 0 until relation is set up)")
 
 
-# ── Daily Log ──────────────────────────────────────────────────────────────────────────────
+# ── Daily Log ──────────────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_or_create_daily_log(today: date) -> str:
@@ -263,39 +263,50 @@ async def get_or_create_daily_log(today: date) -> str:
 @_retry
 async def get_today_totals(today: date) -> dict:
     date_str = today.isoformat()
-    try:
-        schema = await _get_daily_db_props()
-        title_prop = _find_title_prop(schema, db_label="Daily Log database")
-    except Exception:
-        title_prop = "Name"
+
+    # Sum directly from Food Entries — no rollup dependency
     response = await notion.databases.query(
-        database_id=config.NOTION_DAILY_DB_ID,
-        filter={"property": title_prop, "title": {"equals": date_str}},
+        database_id=config.NOTION_FOOD_DB_ID,
+        filter={"property": "Date", "date": {"equals": date_str}},
+        page_size=100,
     )
-    if not response["results"]:
-        return {}
-
-    props = response["results"][0]["properties"]
-
-    def _rollup(name: str) -> float:
-        prop = props.get(name, {})
-        if prop.get("type") == "rollup":
-            return float(prop.get("rollup", {}).get("number") or 0)
-        if prop.get("type") == "number":
-            return float(prop.get("number") or 0)
-        return 0.0
-
-    return {
-        "calories":   _rollup("Total Calories"),
-        "protein_g":  _rollup("Total Protein"),
-        "carbs_g":    _rollup("Total Carbs"),
-        "fat_g":      _rollup("Total Fat"),
-        "fiber_g":    _rollup("Total Fiber"),
-        "sugar_g":    _rollup("Total Sugar"),
-        "sodium_mg":  _rollup("Total Sodium"),
-        "water_ml":   float(props.get("Water (ml)", {}).get("number") or 0),
-        "weight_kg":  float(props.get("Weight (kg)", {}).get("number") or 0),
+    totals: dict[str, float] = {
+        "calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0,
+        "fat_g": 0.0, "fiber_g": 0.0, "sugar_g": 0.0, "sodium_mg": 0.0,
     }
+    for page in response["results"]:
+        props = page["properties"]
+        def _n(k: str) -> float:
+            return float(props.get(k, {}).get("number") or 0)
+        totals["calories"]  += _n("Calories")
+        totals["protein_g"] += _n("Protein")
+        totals["carbs_g"]   += _n("Carbs")
+        totals["fat_g"]     += _n("Fat")
+        totals["fiber_g"]   += _n("Fiber")
+        totals["sugar_g"]   += _n("Sugar")
+        totals["sodium_mg"] += _n("Sodium")
+
+    # Water and weight still live in Daily Log
+    water_ml = 0.0
+    weight_kg = 0.0
+    try:
+        try:
+            schema = await _get_daily_db_props()
+            title_prop = _find_title_prop(schema, db_label="Daily Log database")
+        except Exception:
+            title_prop = "Name"
+        dl_resp = await notion.databases.query(
+            database_id=config.NOTION_DAILY_DB_ID,
+            filter={"property": title_prop, "title": {"equals": date_str}},
+        )
+        if dl_resp["results"]:
+            dl_props = dl_resp["results"][0]["properties"]
+            water_ml  = float(dl_props.get("Water (ml)",  {}).get("number") or 0)
+            weight_kg = float(dl_props.get("Weight (kg)", {}).get("number") or 0)
+    except Exception:
+        pass
+
+    return {**totals, "water_ml": water_ml, "weight_kg": weight_kg}
 
 
 @_retry
@@ -345,7 +356,7 @@ async def get_fasting_status(today: date) -> bool:
         return False
 
 
-# ── Food Entries ─────────────────────────────────────────────────────────────────────────────
+# ── Food Entries ──────────────────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def create_food_entry(
@@ -450,23 +461,19 @@ async def get_week_calorie_bank(calorie_goal: int = 0) -> dict:
     days_elapsed = today.weekday() + 1
 
     response = await notion.databases.query(
-        database_id=config.NOTION_DAILY_DB_ID,
+        database_id=config.NOTION_FOOD_DB_ID,
         filter={
             "and": [
                 {"property": "Date", "date": {"on_or_after":  week_start.isoformat()}},
                 {"property": "Date", "date": {"on_or_before": today.isoformat()}},
             ]
         },
-        page_size=7,
+        page_size=200,
     )
-
-    def _rollup(props: dict, name: str) -> float:
-        prop = props.get(name, {})
-        if prop.get("type") == "rollup":
-            return float(prop.get("rollup", {}).get("number") or 0)
-        return float(prop.get("number") or 0)
-
-    total_cal = sum(_rollup(p["properties"], "Total Calories") for p in response["results"])
+    total_cal = sum(
+        float(p["properties"].get("Calories", {}).get("number") or 0)
+        for p in response["results"]
+    )
     goal = calorie_goal if calorie_goal > 0 else config.DAILY_CALORIES_GOAL
     expected = goal * days_elapsed
     return {
@@ -561,7 +568,7 @@ async def create_monthly_review_page(month_data: dict) -> str:
     return page_url
 
 
-# ── Saved Meals ──────────────────────────────────────────────────────────────────────────────
+# ── Saved Meals ──────────────────────────────────────────────────────────────────────────────────────────
 
 async def ensure_saved_meals_db() -> None:
     if config.NOTION_SAVED_MEALS_DB_ID:
@@ -779,7 +786,7 @@ async def get_recent_meals(limit: int = 5) -> list[dict]:
     return meals
 
 
-# ── Restaurants ─────────────────────────────────────────────────────────────────────────────
+# ── Restaurants ─────────────────────────────────────────────────────────────────────────────────────────
 
 async def search_restaurants(query: str) -> list[dict]:
     if not config.NOTION_RESTAURANTS_DB_ID:
@@ -810,7 +817,7 @@ async def add_restaurant(name: str, cuisine: str = "") -> str:
     return new_page.get("url", "")
 
 
-# ── Weekly Review ──────────────────────────────────────────────────────────────────────────
+# ── Weekly Review ──────────────────────────────────────────────────────────────────────────────────
 
 async def get_last_week_data() -> dict:
     today = date.today()
@@ -878,7 +885,7 @@ async def create_weekly_review_page(week_data: dict) -> str:
     return new_page.get("url", "")
 
 
-# ── Weight tracking ──────────────────────────────────────────────────────────────────────────
+# ── Weight tracking ──────────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def log_weight(weight_kg: float, today: date) -> None:
@@ -909,7 +916,7 @@ async def get_recent_weights(limit: int = 8) -> list[dict]:
     return results
 
 
-# ── Yesterday's meals ────────────────────────────────────────────────────────────────────────
+# ── Yesterday's meals ──────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_yesterday_meals() -> list[dict]:
@@ -987,30 +994,21 @@ async def get_today_food_entries(today: date) -> list[dict]:
     return entries
 
 
-# ── Chart data ─────────────────────────────────────────────────────────────────────────────
+# ── Chart data ─────────────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_daily_totals_range(start: date, end: date) -> list[dict]:
-    response = await notion.databases.query(
-        database_id=config.NOTION_DAILY_DB_ID,
+    # Aggregate Food Entries by date — no rollup dependency
+    food_resp = await notion.databases.query(
+        database_id=config.NOTION_FOOD_DB_ID,
         filter={"and": [
             {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
             {"property": "Date", "date": {"on_or_before": end.isoformat()}},
         ]},
-        sorts=[{"property": "Date", "direction": "ascending"}],
-        page_size=50,
+        page_size=200,
     )
-
-    def _rollup(props: dict, name: str) -> float:
-        prop = props.get(name, {})
-        if prop.get("type") == "rollup":
-            return float(prop.get("rollup", {}).get("number") or 0)
-        if prop.get("type") == "number":
-            return float(prop.get("number") or 0)
-        return 0.0
-
     by_date: dict[date, dict] = {}
-    for page in response["results"]:
+    for page in food_resp["results"]:
         props = page["properties"]
         date_raw = (props.get("Date", {}).get("date") or {}).get("start", "")
         if not date_raw:
@@ -1019,15 +1017,40 @@ async def get_daily_totals_range(start: date, end: date) -> list[dict]:
             page_date = date.fromisoformat(date_raw)
         except ValueError:
             continue
-        by_date[page_date] = {
-            "date": page_date,
-            "calories":  _rollup(props, "Total Calories"),
-            "protein_g": _rollup(props, "Total Protein"),
-            "carbs_g":   _rollup(props, "Total Carbs"),
-            "fat_g":     _rollup(props, "Total Fat"),
-            "fiber_g":   _rollup(props, "Total Fiber"),
-            "water_ml":  float(props.get("Water (ml)", {}).get("number") or 0),
-        }
+        if page_date not in by_date:
+            by_date[page_date] = {
+                "date": page_date, "calories": 0.0, "protein_g": 0.0,
+                "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "water_ml": 0.0,
+            }
+        by_date[page_date]["calories"]  += float(props.get("Calories", {}).get("number") or 0)
+        by_date[page_date]["protein_g"] += float(props.get("Protein",  {}).get("number") or 0)
+        by_date[page_date]["carbs_g"]   += float(props.get("Carbs",    {}).get("number") or 0)
+        by_date[page_date]["fat_g"]     += float(props.get("Fat",      {}).get("number") or 0)
+        by_date[page_date]["fiber_g"]   += float(props.get("Fiber",    {}).get("number") or 0)
+
+    # Overlay water_ml from Daily Log
+    try:
+        dl_resp = await notion.databases.query(
+            database_id=config.NOTION_DAILY_DB_ID,
+            filter={"and": [
+                {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
+                {"property": "Date", "date": {"on_or_before": end.isoformat()}},
+            ]},
+            page_size=50,
+        )
+        for page in dl_resp["results"]:
+            props = page["properties"]
+            date_raw = (props.get("Date", {}).get("date") or {}).get("start", "")
+            if not date_raw:
+                continue
+            try:
+                page_date = date.fromisoformat(date_raw)
+            except ValueError:
+                continue
+            if page_date in by_date:
+                by_date[page_date]["water_ml"] = float(props.get("Water (ml)", {}).get("number") or 0)
+    except Exception:
+        pass
 
     result = []
     current = start
@@ -1040,7 +1063,7 @@ async def get_daily_totals_range(start: date, end: date) -> list[dict]:
     return result
 
 
-# ── User goals (persisted in Notion) ──────────────────────────────────────────────────────────
+# ── User goals (persisted in Notion) ──────────────────────────────────────────────────────────────────────────────
 
 _GOAL_PROPS = {
     "Goal Calories": "calories",
@@ -1102,7 +1125,7 @@ async def save_user_goals(goals: dict) -> None:
         logger.warning("Could not save user goals to Notion: %s", exc)
 
 
-# ── Export data ─────────────────────────────────────────────────────────────────────────────
+# ── Export data ─────────────────────────────────────────────────────────────────────────────────────
 
 async def get_food_entries_range(start: date, end: date) -> list[dict]:
     query_filter = {"and": [
