@@ -158,10 +158,25 @@ async def create_food_entry(
             "files": [{"name": "food_photo.jpg", "external": {"url": photo_url}}]
         }
 
-    new_page = await notion.pages.create(
-        parent={"database_id": config.NOTION_FOOD_DB_ID},
-        properties=properties,
-    )
+    try:
+        new_page = await notion.pages.create(
+            parent={"database_id": config.NOTION_FOOD_DB_ID},
+            properties=properties,
+        )
+    except Exception as e:
+        # If Notion rejects because optional columns don't exist yet, retry without them
+        err_str = str(e).lower()
+        if "meal type" in err_str or "log method" in err_str or "validation" in err_str or "400" in err_str:
+            logger.warning("Notion rejected optional properties, retrying without Meal Type / Log Method: %s", e)
+            properties.pop("Meal Type", None)
+            properties.pop("Log Method", None)
+            new_page = await notion.pages.create(
+                parent={"database_id": config.NOTION_FOOD_DB_ID},
+                properties=properties,
+            )
+        else:
+            raise
+
     page_url: str = new_page.get("url", "")
     page_id: str = new_page.get("id", "")
     logger.info("Created Food Entry page: %s", page_url)
