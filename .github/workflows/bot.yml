@@ -43,7 +43,7 @@ jobs:
           NOTION_DAILY_DB_ID:       ${{ secrets.NOTION_DAILY_DB_ID }}
           NOTION_PARENT_PAGE_ID:    ${{ secrets.NOTION_PARENT_PAGE_ID }}
           NOTION_SAVED_MEALS_DB_ID: ${{ secrets.NOTION_SAVED_MEALS_DB_ID }}
-          NOTION_WORKOUT_DB_ID:     ${{ secrets.NOTION_WORKOUT_DB_ID }}
+          NOTION_WORKOUT_DB_ID:     "a8c936e3-4371-4342-84c3-b11ba815e320"
           TIMEZONE_HOURS:           "3"
 
       - name: Save bot state
