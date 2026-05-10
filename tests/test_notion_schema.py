@@ -63,12 +63,20 @@ class FakeDatabases:
     def __init__(self, schema: dict, query_results: list | None = None):
         self.schema = schema
         self.query_results = query_results or []
+        self.last_query = None
+        self.updated = []
 
     async def retrieve(self, **kwargs):
         return {"properties": self.schema}
 
     async def query(self, **kwargs):
+        self.last_query = kwargs
         return {"results": self.query_results}
+
+    async def update(self, **kwargs):
+        self.updated.append(kwargs)
+        self.schema.update(kwargs.get("properties", {}))
+        return {"properties": self.schema}
 
 
 class FakePages:
@@ -89,6 +97,7 @@ class FakeNotion:
 class NotionFoodEntrySchemaTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         notion_helper._FOOD_DB_PROPS = None
+        notion_helper._DAILY_DB_PROPS = None
 
     async def test_create_food_entry_uses_legacy_protein_property(self):
         fake = FakeNotion({
@@ -155,6 +164,10 @@ class NotionFoodEntrySchemaTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NotionTodayEntryMappingTests(unittest.TestCase):
+    def setUp(self):
+        notion_helper._FOOD_DB_PROPS = None
+        notion_helper._DAILY_DB_PROPS = None
+
     def test_today_entries_reads_protein_then_fallback(self):
         results = [
             {
@@ -187,6 +200,30 @@ class NotionTodayEntryMappingTests(unittest.TestCase):
 
         self.assertEqual(entries[0]["protein_g"], 18)
         self.assertEqual(entries[1]["protein_g"], 12)
+
+
+class NotionDailyLogSchemaTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        notion_helper._FOOD_DB_PROPS = None
+        notion_helper._DAILY_DB_PROPS = None
+
+    async def test_daily_log_uses_existing_title_property(self):
+        fake = FakeNotion({
+            "Day": _prop("title"),
+            "Date": _prop("date"),
+        })
+        old_notion = notion_helper.notion
+        notion_helper.notion = fake
+        try:
+            page_id = await notion_helper.get_or_create_daily_log(date(2026, 5, 10))
+        finally:
+            notion_helper.notion = old_notion
+
+        self.assertEqual(page_id, "page-id")
+        self.assertEqual(fake.databases.last_query["filter"]["property"], "Day")
+        props = fake.pages.created[0]["properties"]
+        self.assertIn("Day", props)
+        self.assertIn("Date", props)
 
 
 if __name__ == "__main__":

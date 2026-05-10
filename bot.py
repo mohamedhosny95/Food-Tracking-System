@@ -52,6 +52,7 @@ from notion_helper import (
     save_user_goals,
     delete_saved_meal,
     ensure_saved_meals_db,
+    ensure_notion_schema,
     get_streak,
     archive_food_entry,
     get_week_calorie_bank,
@@ -3514,6 +3515,10 @@ def main() -> None:
             BotCommand("export",      "Export your food log as CSV"),
             BotCommand("help",        "Show all commands"),
         ])
+        try:
+            await ensure_notion_schema()
+        except Exception:
+            logger.exception("Could not repair Notion database schema on startup")
         await ensure_saved_meals_db()
         await _maybe_create_weekly_review(application)
         await _maybe_create_monthly_review(application)

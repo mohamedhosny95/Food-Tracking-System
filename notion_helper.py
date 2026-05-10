@@ -15,6 +15,7 @@ _retry = retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, m
 notion = AsyncClient(auth=config.NOTION_API_KEY)
 
 _FOOD_DB_PROPS: dict | None = None
+_DAILY_DB_PROPS: dict | None = None
 
 
 async def _get_food_db_props() -> dict:
@@ -24,6 +25,15 @@ async def _get_food_db_props() -> dict:
         db = await notion.databases.retrieve(database_id=config.NOTION_FOOD_DB_ID)
         _FOOD_DB_PROPS = db.get("properties", {})
     return _FOOD_DB_PROPS
+
+
+async def _get_daily_db_props(refresh: bool = False) -> dict:
+    """Return cached Daily Log database properties."""
+    global _DAILY_DB_PROPS
+    if refresh or _DAILY_DB_PROPS is None:
+        db = await notion.databases.retrieve(database_id=config.NOTION_DAILY_DB_ID)
+        _DAILY_DB_PROPS = db.get("properties", {})
+    return _DAILY_DB_PROPS
 
 
 def _find_prop(props: dict, candidates: list[str], prop_type: str | None = None) -> str | None:
@@ -44,14 +54,14 @@ def _find_prop(props: dict, candidates: list[str], prop_type: str | None = None)
     return None
 
 
-def _find_title_prop(props: dict) -> str:
-    name = _find_prop(props, ["Name"], "title")
+def _find_title_prop(props: dict, preferred: str = "Name", db_label: str = "database") -> str:
+    name = _find_prop(props, [preferred], "title")
     if name:
         return name
     for prop_name, prop in props.items():
         if prop.get("type") == "title":
             return prop_name
-    raise RuntimeError("Food Entries database needs a title property such as 'Name'.")
+    raise RuntimeError(f"{db_label} needs a title property such as '{preferred}'.")
 
 
 def _set_if_present(
@@ -66,26 +76,156 @@ def _set_if_present(
         target[name] = value
 
 
+def _missing_props(schema: dict, desired: dict) -> dict:
+    return {name: value for name, value in desired.items() if name not in schema}
+
+
+async def ensure_notion_schema() -> None:
+    """Best-effort repair for the Notion databases the bot writes to."""
+    global _FOOD_DB_PROPS, _DAILY_DB_PROPS
+
+    food_schema = await _get_food_db_props()
+    daily_schema = await _get_daily_db_props()
+
+    food_updates = _missing_props(food_schema, {
+        "Date":         {"date": {}},
+        "Calories":     {"number": {"format": "number"}},
+        "Protein":      {"number": {"format": "number"}},
+        "Carbs":        {"number": {"format": "number"}},
+        "Fat":          {"number": {"format": "number"}},
+        "Fiber":        {"number": {"format": "number"}},
+        "Sugar":        {"number": {"format": "number"}},
+        "Sodium":       {"number": {"format": "number"}},
+        "Portion Size": {"rich_text": {}},
+        "Confidence": {
+            "select": {
+                "options": [
+                    {"name": "High",   "color": "green"},
+                    {"name": "Medium", "color": "yellow"},
+                    {"name": "Low",    "color": "red"},
+                ]
+            }
+        },
+        "Notes":        {"rich_text": {}},
+        "Photo":        {"files": {}},
+        "Meal Type": {
+            "select": {
+                "options": [
+                    {"name": "Breakfast", "color": "yellow"},
+                    {"name": "Lunch",     "color": "green"},
+                    {"name": "Dinner",    "color": "blue"},
+                    {"name": "Snack",     "color": "orange"},
+                ]
+            }
+        },
+        "Log Method": {
+            "select": {
+                "options": [
+                    {"name": "Photo",       "color": "purple"},
+                    {"name": "Restaurant",  "color": "red"},
+                    {"name": "Ingredients", "color": "green"},
+                    {"name": "Barcode",     "color": "blue"},
+                    {"name": "Voice",       "color": "pink"},
+                    {"name": "Re-log",      "color": "gray"},
+                ]
+            }
+        },
+    })
+    if "Daily Log" not in food_schema:
+        food_updates["Daily Log"] = {
+            "relation": {
+                "database_id": config.NOTION_DAILY_DB_ID,
+                "type": "dual_property",
+                "dual_property": {},
+            }
+        }
+
+    if food_updates:
+        await notion.databases.update(database_id=config.NOTION_FOOD_DB_ID, properties=food_updates)
+        _FOOD_DB_PROPS = None
+        food_schema = await _get_food_db_props()
+
+    daily_updates = _missing_props(daily_schema, {
+        "Date":            {"date": {}},
+        "Water (ml)":      {"number": {"format": "number"}},
+        "Weight (kg)":     {"number": {"format": "number"}},
+        "Fasting":         {"checkbox": {}},
+        "Goal Calories":   {"number": {"format": "number"}},
+        "Goal Protein":    {"number": {"format": "number"}},
+        "Goal Carbs":      {"number": {"format": "number"}},
+        "Goal Fat":        {"number": {"format": "number"}},
+        "Goal Fiber":      {"number": {"format": "number"}},
+        "Goal Water":      {"number": {"format": "number"}},
+    })
+
+    relation_name = None
+    daily_schema = await _get_daily_db_props(refresh=True)
+    for prop_name, prop in daily_schema.items():
+        if prop.get("type") != "relation":
+            continue
+        related_id = prop.get("relation", {}).get("database_id", "").replace("-", "")
+        if related_id == config.NOTION_FOOD_DB_ID.replace("-", ""):
+            relation_name = prop_name
+            break
+
+    if relation_name:
+        for rollup_name, source_prop in [
+            ("Total Calories", "Calories"),
+            ("Total Protein",  _find_prop(food_schema, ["Protein", "Protein (g)"], "number") or "Protein"),
+            ("Total Carbs",    _find_prop(food_schema, ["Carbs", "Carbs (g)", "Carbohydrates"], "number") or "Carbs"),
+            ("Total Fat",      _find_prop(food_schema, ["Fat", "Fat (g)"], "number") or "Fat"),
+            ("Total Fiber",    _find_prop(food_schema, ["Fiber", "Fiber (g)"], "number") or "Fiber"),
+            ("Total Sugar",    _find_prop(food_schema, ["Sugar", "Sugar (g)"], "number") or "Sugar"),
+            ("Total Sodium",   _find_prop(food_schema, ["Sodium", "Sodium (mg)"], "number") or "Sodium"),
+        ]:
+            if rollup_name not in daily_schema:
+                daily_updates[rollup_name] = {
+                    "rollup": {
+                        "relation_property_name": relation_name,
+                        "rollup_property_name": source_prop,
+                        "function": "sum",
+                    }
+                }
+        if "Entry Count" not in daily_schema:
+            daily_updates["Entry Count"] = {
+                "rollup": {
+                    "relation_property_name": relation_name,
+                    "rollup_property_name": _find_title_prop(food_schema, db_label="Food Entries database"),
+                    "function": "count",
+                }
+            }
+
+    if daily_updates:
+        await notion.databases.update(database_id=config.NOTION_DAILY_DB_ID, properties=daily_updates)
+        _DAILY_DB_PROPS = None
+
+
 # ── Daily Log ──────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_or_create_daily_log(today: date) -> str:
     date_str = today.isoformat()
+    schema = await _get_daily_db_props()
+    title_prop = _find_title_prop(schema, db_label="Daily Log database")
+    date_prop = _find_prop(schema, ["Date"], "date")
     response = await notion.databases.query(
         database_id=config.NOTION_DAILY_DB_ID,
-        filter={"property": "Name", "title": {"equals": date_str}},
+        filter={"property": title_prop, "title": {"equals": date_str}},
     )
     if response["results"]:
         page_id = response["results"][0]["id"]
         logger.info("Found existing Daily Log page for %s: %s", date_str, page_id)
         return page_id
 
+    properties = {
+        title_prop: {"title": [{"text": {"content": date_str}}]},
+    }
+    if date_prop:
+        properties[date_prop] = {"date": {"start": date_str}}
+
     new_page = await notion.pages.create(
         parent={"database_id": config.NOTION_DAILY_DB_ID},
-        properties={
-            "Name": {"title": [{"text": {"content": date_str}}]},
-            "Date": {"date": {"start": date_str}},
-        },
+        properties=properties,
     )
     page_id = new_page["id"]
     logger.info("Created new Daily Log page for %s: %s", date_str, page_id)
@@ -95,9 +235,11 @@ async def get_or_create_daily_log(today: date) -> str:
 @_retry
 async def get_today_totals(today: date) -> dict:
     date_str = today.isoformat()
+    schema = await _get_daily_db_props()
+    title_prop = _find_title_prop(schema, db_label="Daily Log database")
     response = await notion.databases.query(
         database_id=config.NOTION_DAILY_DB_ID,
-        filter={"property": "Name", "title": {"equals": date_str}},
+        filter={"property": title_prop, "title": {"equals": date_str}},
     )
     if not response["results"]:
         return {}
@@ -156,9 +298,11 @@ async def get_fasting_status(today: date) -> bool:
     """Read the Fasting checkbox from today's Daily Log page. Returns False if missing."""
     date_str = today.isoformat()
     try:
+        schema = await _get_daily_db_props()
+        title_prop = _find_title_prop(schema, db_label="Daily Log database")
         response = await notion.databases.query(
             database_id=config.NOTION_DAILY_DB_ID,
-            filter={"property": "Name", "title": {"equals": date_str}},
+            filter={"property": title_prop, "title": {"equals": date_str}},
         )
         if not response["results"]:
             return False
@@ -184,7 +328,7 @@ async def create_food_entry(
     schema = await _get_food_db_props()
 
     properties: dict = {
-        _find_title_prop(schema): {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
+        _find_title_prop(schema, db_label="Food Entries database"): {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
     }
 
     _set_if_present(properties, schema, ["Date"], {"date": {"start": date_str}}, "date")
@@ -1021,9 +1165,11 @@ _GOALS_PAGE_NAME = "⚙️ Goals"
 async def get_user_goals() -> dict:
     """Read custom macro goals stored as a special page in the Daily Log DB."""
     try:
+        schema = await _get_daily_db_props()
+        title_prop = _find_title_prop(schema, db_label="Daily Log database")
         response = await notion.databases.query(
             database_id=config.NOTION_DAILY_DB_ID,
-            filter={"property": "Name", "title": {"equals": _GOALS_PAGE_NAME}},
+            filter={"property": title_prop, "title": {"equals": _GOALS_PAGE_NAME}},
         )
         if not response["results"]:
             return {}
@@ -1041,8 +1187,10 @@ async def get_user_goals() -> dict:
 
 async def save_user_goals(goals: dict) -> None:
     """Persist updated macro goals to the ⚙️ Goals page in the Daily Log DB."""
+    schema = await _get_daily_db_props()
+    title_prop = _find_title_prop(schema, db_label="Daily Log database")
     properties: dict = {
-        "Name": {"title": [{"text": {"content": _GOALS_PAGE_NAME}}]},
+        title_prop: {"title": [{"text": {"content": _GOALS_PAGE_NAME}}]},
     }
     for notion_key, goal_key in _GOAL_PROPS.items():
         if goal_key in goals:
@@ -1051,7 +1199,7 @@ async def save_user_goals(goals: dict) -> None:
     try:
         response = await notion.databases.query(
             database_id=config.NOTION_DAILY_DB_ID,
-            filter={"property": "Name", "title": {"equals": _GOALS_PAGE_NAME}},
+            filter={"property": title_prop, "title": {"equals": _GOALS_PAGE_NAME}},
         )
         if response["results"]:
             await notion.pages.update(
