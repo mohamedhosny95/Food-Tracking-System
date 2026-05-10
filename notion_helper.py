@@ -14,6 +14,57 @@ _retry = retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, m
 
 notion = AsyncClient(auth=config.NOTION_API_KEY)
 
+_FOOD_DB_PROPS: dict | None = None
+
+
+async def _get_food_db_props() -> dict:
+    """Return cached Food Entries database properties."""
+    global _FOOD_DB_PROPS
+    if _FOOD_DB_PROPS is None:
+        db = await notion.databases.retrieve(database_id=config.NOTION_FOOD_DB_ID)
+        _FOOD_DB_PROPS = db.get("properties", {})
+    return _FOOD_DB_PROPS
+
+
+def _find_prop(props: dict, candidates: list[str], prop_type: str | None = None) -> str | None:
+    """Find the first existing Notion property by exact/case-insensitive name."""
+    for name in candidates:
+        prop = props.get(name)
+        if prop and (prop_type is None or prop.get("type") == prop_type):
+            return name
+
+    lowered = {name.lower(): name for name in props}
+    for candidate in candidates:
+        name = lowered.get(candidate.lower())
+        if not name:
+            continue
+        prop = props.get(name, {})
+        if prop_type is None or prop.get("type") == prop_type:
+            return name
+    return None
+
+
+def _find_title_prop(props: dict) -> str:
+    name = _find_prop(props, ["Name"], "title")
+    if name:
+        return name
+    for prop_name, prop in props.items():
+        if prop.get("type") == "title":
+            return prop_name
+    raise RuntimeError("Food Entries database needs a title property such as 'Name'.")
+
+
+def _set_if_present(
+    target: dict,
+    schema: dict,
+    candidates: list[str],
+    value: dict,
+    prop_type: str | None = None,
+) -> None:
+    name = _find_prop(schema, candidates, prop_type)
+    if name:
+        target[name] = value
+
 
 # ── Daily Log ──────────────────────────────────────────────────────────────────
 
@@ -130,52 +181,52 @@ async def create_food_entry(
     log_method: str = "",
 ) -> tuple[str, str]:
     date_str = today.isoformat()
+    schema = await _get_food_db_props()
 
     properties: dict = {
-        "Name":        {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
-        "Date":        {"date": {"start": date_str}},
-        "Calories":    {"number": round(nutrition.calories, 1)},
-        "Protein":     {"number": round(nutrition.protein_g, 1)},
-        "Carbs":       {"number": round(nutrition.carbs_g, 1)},
-        "Fat":         {"number": round(nutrition.fat_g, 1)},
-        "Fiber":       {"number": round(nutrition.fiber_g, 1)},
-        "Sugar":       {"number": round(nutrition.sugar_g, 1)},
-        "Sodium":      {"number": int(nutrition.sodium_mg)},
-        "Portion Size":{"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
-        "Confidence":  {"select": {"name": nutrition.confidence}},
-        "Notes":       {"rich_text": [{"text": {"content": nutrition.notes[:2000]}}]},
-        "Daily Log":   {"relation": [{"id": daily_log_id}]},
+        _find_title_prop(schema): {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
     }
 
+    _set_if_present(properties, schema, ["Date"], {"date": {"start": date_str}}, "date")
+    _set_if_present(properties, schema, ["Calories"], {"number": round(nutrition.calories, 1)}, "number")
+    _set_if_present(properties, schema, ["Protein", "Protein (g)"], {"number": round(nutrition.protein_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Carbs", "Carbs (g)", "Carbohydrates"], {"number": round(nutrition.carbs_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Fat", "Fat (g)"], {"number": round(nutrition.fat_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Fiber", "Fiber (g)"], {"number": round(nutrition.fiber_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Sugar", "Sugar (g)"], {"number": round(nutrition.sugar_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Sodium", "Sodium (mg)"], {"number": int(nutrition.sodium_mg)}, "number")
+    _set_if_present(
+        properties,
+        schema,
+        ["Portion Size", "Portion"],
+        {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
+        "rich_text",
+    )
+    _set_if_present(properties, schema, ["Confidence"], {"select": {"name": nutrition.confidence}}, "select")
+    _set_if_present(
+        properties,
+        schema,
+        ["Notes"],
+        {"rich_text": [{"text": {"content": nutrition.notes[:2000]}}]},
+        "rich_text",
+    )
+    _set_if_present(properties, schema, ["Daily Log"], {"relation": [{"id": daily_log_id}]}, "relation")
+
     if meal_type:
-        properties["Meal Type"] = {"select": {"name": meal_type}}
+        _set_if_present(properties, schema, ["Meal Type"], {"select": {"name": meal_type}}, "select")
 
     if log_method:
-        properties["Log Method"] = {"select": {"name": log_method}}
+        _set_if_present(properties, schema, ["Log Method"], {"select": {"name": log_method}}, "select")
 
-    if photo_url:
-        properties["Photo"] = {
+    if photo_url and _find_prop(schema, ["Photo"], "files"):
+        properties[_find_prop(schema, ["Photo"], "files")] = {
             "files": [{"name": "food_photo.jpg", "external": {"url": photo_url}}]
         }
 
-    try:
-        new_page = await notion.pages.create(
-            parent={"database_id": config.NOTION_FOOD_DB_ID},
-            properties=properties,
-        )
-    except Exception as e:
-        # If Notion rejects because optional columns don't exist yet, retry without them
-        err_str = str(e).lower()
-        if "meal type" in err_str or "log method" in err_str or "validation" in err_str or "400" in err_str:
-            logger.warning("Notion rejected optional properties, retrying without Meal Type / Log Method: %s", e)
-            properties.pop("Meal Type", None)
-            properties.pop("Log Method", None)
-            new_page = await notion.pages.create(
-                parent={"database_id": config.NOTION_FOOD_DB_ID},
-                properties=properties,
-            )
-        else:
-            raise
+    new_page = await notion.pages.create(
+        parent={"database_id": config.NOTION_FOOD_DB_ID},
+        properties=properties,
+    )
 
     page_url: str = new_page.get("url", "")
     page_id: str = new_page.get("id", "")
@@ -888,7 +939,11 @@ async def get_today_food_entries(today: date) -> list[dict]:
             "page_id": page["id"],
             "name": name,
             "calories": float(props.get("Calories", {}).get("number") or 0),
-            "protein_g": float(props.get("Protein (g)", {}).get("number") or 0),
+            "protein_g": float(
+                props.get("Protein", {}).get("number")
+                if props.get("Protein", {}).get("number") is not None
+                else props.get("Protein (g)", {}).get("number") or 0
+            ),
             "meal_type": (props.get("Meal Type", {}).get("select") or {}).get("name", ""),
         })
     return entries
@@ -1067,5 +1122,3 @@ async def get_food_entries_range(start: date, end: date) -> list[dict]:
             break
         cursor = response.get("next_cursor")
     return rows
-
-
