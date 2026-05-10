@@ -1,5 +1,6 @@
 name: Run Bot
 
+# Keeps the deployed Telegram bot refreshed after main updates.
 on:
   push:
     branches: [main]          # restart immediately on every push to main
