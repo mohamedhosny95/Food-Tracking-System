@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 genai.configure(api_key=config.GEMINI_API_KEY)
 _model = genai.GenerativeModel(config.GEMINI_MODEL)
 
-# ── Shared JSON schema rules ───────────────────────────────────────────────
+# ── Shared JSON schema rules ───────────────────────────────────────────────────
 
 _SCHEMA = """{
   "food_name": "string — descriptive name of the food(s)",
@@ -45,7 +45,7 @@ _RULES = """Rules:
 - confidence_pct: 85–100 = High confidence, 55–80 = Medium, 0–50 = Low. Return a specific integer.
 - Do not include units in numeric fields."""
 
-# ── Prompts ────────────────────────────────────────────────────────────────
+# ── Prompts ────────────────────────────────────────────────────────────────────
 
 VISION_PROMPT = f"""You are a professional nutritionist and food analyst. Analyze the food in this image and return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
@@ -74,7 +74,7 @@ The user may write in Arabic or English. Understand Arabic restaurant and dish n
 
 Return ONLY a valid JSON object — no markdown, no explanation, no code blocks, just raw JSON.
 
-Use this exact schema (set food_name to include restaurant e.g. 'Big Mac (McDonald\'s)'):
+Use this exact schema (set food_name to include restaurant e.g. 'Big Mac (McDonald's)'):
 
 {_SCHEMA}
 
@@ -109,7 +109,7 @@ Use this exact schema:
 - Confidence: High = specific quantities clearly stated, Medium = food identified but quantities estimated, Low = audio unclear or food ambiguous."""
 
 
-# ── Data class ────────────────────────────────────────────────────────────────
+# ── Data class ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class NutritionData:
@@ -171,7 +171,7 @@ async def _stream(parts: list) -> str:
     return raw.strip()
 
 
-# ── Analysis functions ──────────────────────────────────────────────────────────
+# ── Analysis functions ─────────────────────────────────────────────────────────
 
 async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
     image = PIL.Image.open(io.BytesIO(image_bytes))
@@ -223,7 +223,7 @@ async def analyze_voice_message(audio_bytes: bytes) -> NutritionData:
     return nutrition
 
 
-# ── Barcode scanning ───────────────────────────────────────────────────────────
+# ── Barcode scanning ──────────────────────────────────────────────────────────
 
 _BARCODE_PROMPT = (
     "Look at this image. If there is a barcode (EAN-13, UPC-A, UPC-E, QR code, etc.) "
@@ -314,7 +314,7 @@ async def lookup_barcode_product(barcode: str) -> NutritionData | None:
     )
 
 
-# ── JSON parsing ─────────────────────────────────────────────────────────────────
+# ── JSON parsing ───────────────────────────────────────────────────────────────
 
 def _scrape_fields(text: str) -> dict | None:
     num = r"(\d+(?:\.\d*)?)"
@@ -420,67 +420,4 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
         recognizable=bool(data.get("recognizable", True)),
         transcription=transcription,
         estimated_weight_g=float(data.get("estimated_weight_g") or 0),
-    )
-
-
-# ── Workout data ───────────────────────────────────────────────────────────────
-
-WORKOUT_PROMPT = """You are a fitness and exercise expert. Parse this workout description and return ONLY valid JSON — no markdown, no explanation, no code blocks.
-
-The user may write in Arabic or English.
-
-Input: "{description}"
-
-Return exactly this JSON schema:
-{{
-  "exercise": "clean exercise name in English (add Arabic in parentheses if input was Arabic, e.g. 'Bench Press (بنش بريس)')",
-  "workout_type": "Strength" or "Cardio" or "Flexibility" or "Sport",
-  "sets": integer (0 if not applicable),
-  "reps": integer (0 if not applicable),
-  "weight_kg": number (0.0 if not applicable),
-  "duration_min": number (0.0 if not applicable),
-  "distance_km": number (0.0 if not applicable),
-  "calories_burned": integer (estimate; 0 if unknown),
-  "notes": "any extra context or assumptions"
-}}
-
-Parsing rules:
-- "3x10" or "3×10" → sets=3, reps=10
-- "80kg" after exercise name → weight_kg=80
-- Strength (bench press, squats, deadlift, curls, etc.): fill sets/reps/weight_kg; duration/distance = 0
-- Cardio (run, bike, swim, rowing, etc.): fill duration_min, distance_km if mentioned; sets/reps/weight = 0
-- Flexibility (yoga, stretching, pilates): fill duration_min; others = 0
-- Estimate calories_burned: running ~10 kcal/min, cycling ~8, weight training ~6, yoga ~4
-- If no sets/reps mentioned for strength, leave as 0"""
-
-
-@dataclass
-class WorkoutData:
-    exercise: str
-    workout_type: str          # Strength | Cardio | Flexibility | Sport
-    sets: int = 0
-    reps: int = 0
-    weight_kg: float = 0.0
-    duration_min: float = 0.0
-    distance_km: float = 0.0
-    calories_burned: int = 0
-    notes: str = ""
-
-
-async def analyze_workout(description: str) -> WorkoutData:
-    safe = description.replace("{", "{{").replace("}", "}}")
-    prompt = WORKOUT_PROMPT.format(description=safe)
-    raw = await _stream([prompt])
-    raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-    data = json.loads(raw)
-    return WorkoutData(
-        exercise=data.get("exercise", description),
-        workout_type=data.get("workout_type", "Strength"),
-        sets=int(data.get("sets") or 0),
-        reps=int(data.get("reps") or 0),
-        weight_kg=float(data.get("weight_kg") or 0),
-        duration_min=float(data.get("duration_min") or 0),
-        distance_km=float(data.get("distance_km") or 0),
-        calories_burned=int(data.get("calories_burned") or 0),
-        notes=data.get("notes", ""),
     )

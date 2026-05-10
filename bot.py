@@ -30,7 +30,6 @@ from vision import (
     extract_barcode_number,
     lookup_barcode_product,
     NutritionData,
-    analyze_workout,
 )
 from notion_helper import (
     get_or_create_daily_log,
@@ -60,9 +59,6 @@ from notion_helper import (
     create_monthly_review_page,
     get_recent_food_entries,
     get_today_food_entries,
-    log_workout_entry,
-    get_recent_workouts,
-    ensure_workout_db,
 )
 
 
@@ -110,9 +106,7 @@ def is_authorized(user_id: int) -> bool:
     TEMPLATE_ENTERING_WEIGHT,    # templates: typing custom gram weight
     TEMPLATE_SAVING_NEW,         # templates: user typed description, awaiting AI + confirm
     SETTING_GOALS,               # /goals: user typing a new goal value
-    WAITING_FOR_WORKOUT_TEXT,    # workout: user typing workout description
-    CONFIRMING_WORKOUT,          # workout: AI result shown, awaiting confirm/cancel
-) = range(19)
+) = range(17)
 
 
 # ── Goal metadata ──────────────────────────────────────────────────────────────
@@ -417,10 +411,7 @@ async def log_again_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ── Menu keyboard builders ─────────────────────────────────────────────────────
 
 def _main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🍽️ Food",    callback_data="menu_food"),
-        InlineKeyboardButton("💪 Workout", callback_data="menu_workout"),
-    ]])
+    return _food_menu_keyboard()
 
 
 def _food_menu_keyboard() -> InlineKeyboardMarkup:
@@ -443,15 +434,6 @@ def _food_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("↩️ Back",           callback_data="menu_main")],
     ])
 
-
-def _workout_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💪 Log Workout", callback_data="menu_workout_log"),
-            InlineKeyboardButton("📋 History",     callback_data="menu_workout_history"),
-        ],
-        [InlineKeyboardButton("↩️ Back",            callback_data="menu_main")],
-    ])
 
 
 # ── /start ─────────────────────────────────────────────────────────────────────
@@ -2062,11 +2044,6 @@ async def menu_food_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text("🍽️ Food Mode", reply_markup=_food_menu_keyboard())
 
 
-async def menu_workout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("💪 Workout Mode", reply_markup=_workout_menu_keyboard())
-
 
 # Food menu action callbacks — each starts the right conversation state
 
@@ -2238,145 +2215,6 @@ async def menu_food_week_callback(update: Update, context: ContextTypes.DEFAULT_
     ]
     await msg.edit_text("\n".join(lines))
 
-
-# ── /workout and workout logging ───────────────────────────────────────────────
-
-async def workout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("Unauthorized.")
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "💪 Describe your workout:\n\n"
-        "Examples:\n"
-        "• bench press 80kg 3×10\n"
-        "• 30 min run 5km\n"
-        "• deadlift 120kg 5x5\n"
-        "• yoga 45 minutes"
-    )
-    return WAITING_FOR_WORKOUT_TEXT
-
-
-async def menu_workout_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "💪 Describe your workout:\n\n"
-        "Examples:\n"
-        "• bench press 80kg 3×10\n"
-        "• 30 min run 5km\n"
-        "• deadlift 120kg 5x5\n"
-        "• yoga 45 minutes"
-    )
-    return WAITING_FOR_WORKOUT_TEXT
-
-
-async def workout_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    description = update.message.text.strip()
-    msg = await update.message.reply_text("Analyzing workout...")
-    try:
-        workout = await analyze_workout(description)
-    except Exception as e:
-        await msg.edit_text(f"Could not parse workout: {e}\n\nTry again with more detail.")
-        return ConversationHandler.END
-
-    context.user_data["pending_workout"] = workout
-    context.user_data["pending_workout_text"] = description
-
-    lines = [f"💪 {workout.exercise}", f"Type: {workout.workout_type}"]
-    if workout.sets and workout.reps:
-        weight_str = f" @ {workout.weight_kg:.1f}kg" if workout.weight_kg else ""
-        lines.append(f"Sets × Reps: {workout.sets} × {workout.reps}{weight_str}")
-    elif workout.weight_kg:
-        lines.append(f"Weight: {workout.weight_kg:.1f} kg")
-    if workout.duration_min:
-        lines.append(f"Duration: {workout.duration_min:.0f} min")
-    if workout.distance_km:
-        lines.append(f"Distance: {workout.distance_km:.2f} km")
-    if workout.calories_burned:
-        lines.append(f"~{workout.calories_burned} kcal burned")
-    if workout.notes:
-        lines.append(f"\nNote: {workout.notes}")
-
-    await msg.edit_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Log it", callback_data="workout_confirm"),
-            InlineKeyboardButton("❌ Cancel",  callback_data="workout_cancel"),
-        ]]),
-    )
-    return CONFIRMING_WORKOUT
-
-
-async def workout_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "workout_cancel":
-        await query.edit_message_text("Cancelled.")
-        return ConversationHandler.END
-
-    workout = context.user_data.pop("pending_workout", None)
-    if not workout:
-        description = context.user_data.pop("pending_workout_text", None)
-        if not description:
-            await query.edit_message_text("Session expired. Please describe the workout again.")
-            return ConversationHandler.END
-        await query.edit_message_text("Re-analyzing workout...")
-        try:
-            workout = await analyze_workout(description)
-        except Exception as e:
-            await query.edit_message_text(f"Could not re-analyze: {e}\n\nPlease describe the workout again.")
-            return ConversationHandler.END
-
-    try:
-        await log_workout_entry(workout, date.today())
-        detail_parts = []
-        if workout.sets and workout.reps:
-            s = f"{workout.sets}×{workout.reps}"
-            if workout.weight_kg:
-                s += f" @ {workout.weight_kg:.1f}kg"
-            detail_parts.append(s)
-        if workout.duration_min:
-            detail_parts.append(f"{workout.duration_min:.0f} min")
-        if workout.distance_km:
-            detail_parts.append(f"{workout.distance_km:.2f} km")
-        detail = "  ".join(detail_parts)
-        await query.edit_message_text(
-            f"✅ {workout.exercise} logged!\n{detail}"
-        )
-    except Exception as e:
-        await query.edit_message_text(f"Failed to log: {e}")
-    return ConversationHandler.END
-
-
-async def menu_workout_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    workouts = await get_recent_workouts(10)
-    if not workouts:
-        await query.edit_message_text(
-            "No workouts logged yet.\n\nTap 💪 Log Workout to add your first one.",
-            reply_markup=_workout_menu_keyboard(),
-        )
-        return
-    lines = ["Recent workouts:\n"]
-    for w in workouts:
-        date_str = w["date"][5:] if w["date"] else "?"
-        if w["sets"] and w["reps"]:
-            detail = f"{w['sets']}×{w['reps']}"
-            if w["weight_kg"]:
-                detail += f" @ {w['weight_kg']:.0f}kg"
-        elif w["duration_min"]:
-            detail = f"{w['duration_min']:.0f}min"
-            if w["distance_km"]:
-                detail += f" / {w['distance_km']:.1f}km"
-        else:
-            detail = w["type"]
-        lines.append(f"{date_str}  {w['exercise'][:22]}  {detail}")
-    await query.edit_message_text(
-        "\n".join(lines),
-        reply_markup=_workout_menu_keyboard(),
-    )
 
 
 # ── /fasting ───────────────────────────────────────────────────────────────────
@@ -2751,19 +2589,7 @@ async def weight_nudge_sunday(context) -> None:
 
 # ── Fallback text ──────────────────────────────────────────────────────────────
 
-_WORKOUT_RE = re.compile(
-    r'\b(?:bench\s*press|squat|deadlift|pull.?up|push.?up|curl|row|press|lunge|dip|plank|'
-    r'run|jog|sprint|cycling|bike|swim|yoga|pilates|stretch|'
-    r'workout|exercise|sets?|reps?|'
-    r'\d+\s*[x×]\s*\d+)\b',
-    re.IGNORECASE,
-)
-
-
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.message.text or "").strip()
-    if _WORKOUT_RE.search(text):
-        return await workout_text_handler(update, context)
     return await ingredients_handler(update, context)
 
 
@@ -3662,13 +3488,12 @@ def main() -> None:
 
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([
-            BotCommand("menu",        "Open Food / Workout mode selector"),
+            BotCommand("menu",        "Open the food tracker menu"),
             BotCommand("log",         "Log a meal or water"),
             BotCommand("breakfast",   "Quick-log breakfast"),
             BotCommand("lunch",       "Quick-log lunch"),
             BotCommand("dinner",      "Quick-log dinner"),
             BotCommand("snack",       "Quick-log a snack"),
-            BotCommand("workout",     "Log a workout session"),
             BotCommand("summary",     "Today's macro progress"),
             BotCommand("today",       "All meals logged today"),
             BotCommand("calories",    "Quick calorie check for today"),
@@ -3690,10 +3515,6 @@ def main() -> None:
             BotCommand("help",        "Show all commands"),
         ])
         await ensure_saved_meals_db()
-        try:
-            await ensure_workout_db()
-        except Exception:
-            logging.getLogger(__name__).warning("Could not ensure Workout Log DB on startup")
         await _maybe_create_weekly_review(application)
         await _maybe_create_monthly_review(application)
         await _ensure_weight_property()
@@ -3744,7 +3565,6 @@ def main() -> None:
             CommandHandler("snack",     quick_log_handler("Snack")),
             CommandHandler("templates", templates_handler),
             CommandHandler("goals",     goals_handler),
-            CommandHandler("workout",   workout_handler),
             CommandHandler("menu",      menu_handler),
             CallbackQueryHandler(summary_quick_water_callback, pattern="^summary_water$"),
             CallbackQueryHandler(summary_quick_log_callback,   pattern="^summary_log$"),
@@ -3754,7 +3574,6 @@ def main() -> None:
             CallbackQueryHandler(menu_food_water_callback,     pattern="^menu_food_water$"),
             CallbackQueryHandler(menu_food_goals_callback,     pattern="^menu_food_goals$"),
             CallbackQueryHandler(menu_food_templates_callback, pattern="^menu_food_templates$"),
-            CallbackQueryHandler(menu_workout_log_callback,    pattern="^menu_workout_log$"),
             MessageHandler(filters.PHOTO, photo_entry),
             MessageHandler(filters.VOICE, voice_entry),
             MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler),
@@ -3828,12 +3647,6 @@ def main() -> None:
                 CallbackQueryHandler(goals_pick_callback,      pattern="^goal_set_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, goals_input_handler),
             ],
-            WAITING_FOR_WORKOUT_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, workout_text_handler),
-            ],
-            CONFIRMING_WORKOUT: [
-                CallbackQueryHandler(workout_confirm_callback, pattern="^workout_(confirm|cancel)$"),
-            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_handler)],
         per_message=False,
@@ -3845,17 +3658,13 @@ def main() -> None:
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("menu",    menu_handler))
-    app.add_handler(CommandHandler("workout", workout_handler))
-    app.add_handler(CallbackQueryHandler(menu_main_callback,             pattern="^menu_main$"))
-    app.add_handler(CallbackQueryHandler(menu_food_callback,             pattern="^menu_food$"))
-    app.add_handler(CallbackQueryHandler(menu_workout_callback,          pattern="^menu_workout$"))
-    app.add_handler(CallbackQueryHandler(menu_food_summary_callback,     pattern="^menu_food_summary$"))
-    app.add_handler(CallbackQueryHandler(menu_food_today_callback,       pattern="^menu_food_today$"))
-    app.add_handler(CallbackQueryHandler(menu_food_chart_callback,       pattern="^menu_food_chart$"))
-    app.add_handler(CallbackQueryHandler(menu_food_weight_callback,      pattern="^menu_food_weight$"))
-    app.add_handler(CallbackQueryHandler(menu_food_week_callback,        pattern="^menu_food_week$"))
-    app.add_handler(CallbackQueryHandler(menu_workout_history_callback,  pattern="^menu_workout_history$"))
-    app.add_handler(CallbackQueryHandler(workout_confirm_callback,       pattern="^workout_(confirm|cancel)$"))
+    app.add_handler(CallbackQueryHandler(menu_main_callback,         pattern="^menu_main$"))
+    app.add_handler(CallbackQueryHandler(menu_food_callback,         pattern="^menu_food$"))
+    app.add_handler(CallbackQueryHandler(menu_food_summary_callback, pattern="^menu_food_summary$"))
+    app.add_handler(CallbackQueryHandler(menu_food_today_callback,   pattern="^menu_food_today$"))
+    app.add_handler(CallbackQueryHandler(menu_food_chart_callback,   pattern="^menu_food_chart$"))
+    app.add_handler(CallbackQueryHandler(menu_food_weight_callback,  pattern="^menu_food_weight$"))
+    app.add_handler(CallbackQueryHandler(menu_food_week_callback,    pattern="^menu_food_week$"))
     app.add_handler(CommandHandler("start",       start_handler))
     app.add_handler(CommandHandler("help",        help_handler))
     app.add_handler(CommandHandler("summary",     summary_handler))

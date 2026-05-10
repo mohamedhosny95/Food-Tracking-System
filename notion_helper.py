@@ -15,7 +15,7 @@ _retry = retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, m
 notion = AsyncClient(auth=config.NOTION_API_KEY)
 
 
-# ── Daily Log ──────────────────────────────────────────────────────────────────────────────
+# ── Daily Log ──────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_or_create_daily_log(today: date) -> str:
@@ -118,7 +118,7 @@ async def get_fasting_status(today: date) -> bool:
         return False
 
 
-# ── Food Entries ─────────────────────────────────────────────────────────────────────────────
+# ── Food Entries ───────────────────────────────────────────────────────────────
 
 @_retry
 async def create_food_entry(
@@ -325,7 +325,7 @@ async def create_monthly_review_page(month_data: dict) -> str:
     return page_url
 
 
-# ── Saved Meals ──────────────────────────────────────────────────────────────────────────────
+# ── Saved Meals ────────────────────────────────────────────────────────────────
 
 async def ensure_saved_meals_db() -> None:
     """
@@ -626,7 +626,7 @@ async def get_recent_meals(limit: int = 5) -> list[dict]:
     return meals
 
 
-# ── Restaurants ─────────────────────────────────────────────────────────────────────────────
+# ── Restaurants ────────────────────────────────────────────────────────────────
 
 async def search_restaurants(query: str) -> list[dict]:
     """Returns restaurants whose name appears in the query string (case-insensitive)."""
@@ -670,7 +670,7 @@ async def add_restaurant(name: str, cuisine: str = "") -> str:
     return new_page.get("url", "")
 
 
-# ── Weekly Review ──────────────────────────────────────────────────────────────────────────
+# ── Weekly Review ──────────────────────────────────────────────────────────────
 
 async def get_last_week_data() -> dict:
     """Returns daily averages and totals for the previous Mon–Sun week."""
@@ -768,7 +768,7 @@ async def create_weekly_review_page(week_data: dict) -> str:
     return page_url
 
 
-# ── Weight tracking ──────────────────────────────────────────────────────────────────────────
+# ── Weight tracking ────────────────────────────────────────────────────────────
 
 @_retry
 async def log_weight(weight_kg: float, today: date) -> None:
@@ -804,7 +804,7 @@ async def get_recent_weights(limit: int = 8) -> list[dict]:
     return results
 
 
-# ── Yesterday's meals ────────────────────────────────────────────────────────────────────────
+# ── Yesterday's meals ──────────────────────────────────────────────────────────
 
 @_retry
 async def get_yesterday_meals() -> list[dict]:
@@ -894,7 +894,7 @@ async def get_today_food_entries(today: date) -> list[dict]:
     return entries
 
 
-# ── Chart data ─────────────────────────────────────────────────────────────────────────────
+# ── Chart data ────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_daily_totals_range(start: date, end: date) -> list[dict]:
@@ -950,7 +950,7 @@ async def get_daily_totals_range(start: date, end: date) -> list[dict]:
     return result
 
 
-# ── User goals (persisted in Notion) ──────────────────────────────────────────────────────────
+# ── User goals (persisted in Notion) ──────────────────────────────────────────
 
 _GOAL_PROPS = {
     "Goal Calories": "calories",
@@ -1013,7 +1013,7 @@ async def save_user_goals(goals: dict) -> None:
         logger.warning("Could not save user goals to Notion: %s", exc)
 
 
-# ── Export data ─────────────────────────────────────────────────────────────────────────────
+# ── Export data ────────────────────────────────────────────────────────────────
 
 async def get_food_entries_range(start: date, end: date) -> list[dict]:
     """Returns all Food Entries between start and end dates (inclusive)."""
@@ -1069,85 +1069,3 @@ async def get_food_entries_range(start: date, end: date) -> list[dict]:
     return rows
 
 
-# ── Workout Log ─────────────────────────────────────────────────────────────────────────────
-
-async def ensure_workout_db() -> str:
-    """Auto-creates the Workout Log DB under NOTION_PARENT_PAGE_ID if not configured."""
-    if config.NOTION_WORKOUT_DB_ID:
-        return config.NOTION_WORKOUT_DB_ID
-    if not config.NOTION_PARENT_PAGE_ID:
-        raise RuntimeError(
-            "Set NOTION_WORKOUT_DB_ID or NOTION_PARENT_PAGE_ID in your environment."
-        )
-    db = await notion.databases.create(
-        parent={"page_id": config.NOTION_PARENT_PAGE_ID},
-        title=[{"text": {"content": "Workout Log"}}],
-        properties={
-            "Exercise":        {"title": {}},
-            "Date":            {"date": {}},
-            "Type":            {"select": {"options": [
-                {"name": "Strength",    "color": "red"},
-                {"name": "Cardio",      "color": "blue"},
-                {"name": "Flexibility", "color": "green"},
-                {"name": "Sport",       "color": "yellow"},
-            ]}},
-            "Sets":            {"number": {"format": "number"}},
-            "Reps":            {"number": {"format": "number"}},
-            "Weight (kg)":     {"number": {"format": "number"}},
-            "Duration (min)":  {"number": {"format": "number"}},
-            "Distance (km)":   {"number": {"format": "number"}},
-            "Calories Burned": {"number": {"format": "number"}},
-            "Notes":           {"rich_text": {}},
-        },
-    )
-    db_id = db["id"]
-    config.NOTION_WORKOUT_DB_ID = db_id
-    logger.info("Created Workout Log DB: %s", db_id)
-    return db_id
-
-
-@_retry
-async def log_workout_entry(data, workout_date: date) -> str:
-    db_id = config.NOTION_WORKOUT_DB_ID or await ensure_workout_db()
-    props: dict = {
-        "Exercise": {"title": [{"text": {"content": data.exercise[:100]}}]},
-        "Date":     {"date": {"start": workout_date.isoformat()}},
-        "Type":     {"select": {"name": data.workout_type}},
-    }
-    if data.sets > 0:          props["Sets"]            = {"number": data.sets}
-    if data.reps > 0:          props["Reps"]            = {"number": data.reps}
-    if data.weight_kg > 0:     props["Weight (kg)"]     = {"number": round(data.weight_kg, 1)}
-    if data.duration_min > 0:  props["Duration (min)"]  = {"number": round(data.duration_min, 1)}
-    if data.distance_km > 0:   props["Distance (km)"]   = {"number": round(data.distance_km, 2)}
-    if data.calories_burned > 0: props["Calories Burned"] = {"number": data.calories_burned}
-    if data.notes:             props["Notes"] = {"rich_text": [{"text": {"content": data.notes[:500]}}]}
-    page = await notion.pages.create(parent={"database_id": db_id}, properties=props)
-    return page["id"]
-
-
-@_retry
-async def get_recent_workouts(limit: int = 10) -> list[dict]:
-    if not config.NOTION_WORKOUT_DB_ID:
-        return []
-    response = await notion.databases.query(
-        database_id=config.NOTION_WORKOUT_DB_ID,
-        sorts=[{"timestamp": "created_time", "direction": "descending"}],
-        page_size=limit,
-    )
-    results = []
-    for page in response["results"]:
-        props = page["properties"]
-        titles = props.get("Exercise", {}).get("title", [])
-        exercise = (titles[0].get("text") or {}).get("content", "?") if titles else "?"
-        results.append({
-            "exercise":       exercise,
-            "date":           (props.get("Date", {}).get("date") or {}).get("start", ""),
-            "type":           (props.get("Type", {}).get("select") or {}).get("name", ""),
-            "sets":           props.get("Sets", {}).get("number") or 0,
-            "reps":           props.get("Reps", {}).get("number") or 0,
-            "weight_kg":      props.get("Weight (kg)", {}).get("number") or 0,
-            "duration_min":   props.get("Duration (min)", {}).get("number") or 0,
-            "distance_km":    props.get("Distance (km)", {}).get("number") or 0,
-            "calories_burned":props.get("Calories Burned", {}).get("number") or 0,
-        })
-    return results

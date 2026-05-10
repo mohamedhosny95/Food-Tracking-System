@@ -7,8 +7,7 @@ Run this ONCE before starting the bot. It will:
   2. Create the "Daily Log" database
   3. Link them with a relation + back-relation
   4. Add 8 rollup properties (sum of each macro per day)
-  5. Create the "Workout Log" database
-  6. Write all database IDs into your .env file automatically
+  5. Write all database IDs into your .env file automatically
 
 Usage:
     python setup_notion.py
@@ -183,51 +182,18 @@ async def setup() -> None:
     )
     print("  ✓ 8 rollup properties added (Total Calories, Protein, Carbs, Fat, Fiber, Sugar, Sodium, Entry Count)")
 
-    # ── Step 6: Create Workout Log database ───────────────────────────────────
-    print("Creating 'Workout Log' database...")
-    workout_db = await notion.databases.create(
-        parent={"type": "page_id", "page_id": parent_page_id},
-        title=[{"type": "text", "text": {"content": "Workout Log"}}],
-        properties={
-            "Exercise":        {"title": {}},
-            "Date":            {"date": {}},
-            "Type": {
-                "select": {
-                    "options": [
-                        {"name": "Strength",    "color": "red"},
-                        {"name": "Cardio",      "color": "blue"},
-                        {"name": "Flexibility", "color": "green"},
-                        {"name": "Sport",       "color": "yellow"},
-                    ]
-                }
-            },
-            "Sets":            {"number": {"format": "number"}},
-            "Reps":            {"number": {"format": "number"}},
-            "Weight (kg)":     {"number": {"format": "number"}},
-            "Duration (min)":  {"number": {"format": "number"}},
-            "Distance (km)":   {"number": {"format": "number"}},
-            "Calories Burned": {"number": {"format": "number"}},
-            "Notes":           {"rich_text": {}},
-        },
-    )
-    workout_db_id: str = workout_db["id"]
-    print(f"  ✓ Workout Log created   →  {workout_db_id}")
-
-    # ── Step 7: Write IDs to .env ──────────────────────────────────────────────
+    # ── Step 6: Write IDs to .env ──────────────────────────────────────────────
     print("\nWriting database IDs to .env...")
     _update_env_file("NOTION_FOOD_DB_ID", food_db_id)
     _update_env_file("NOTION_DAILY_DB_ID", daily_db_id)
-    _update_env_file("NOTION_WORKOUT_DB_ID", workout_db_id)
     print("  ✓ NOTION_FOOD_DB_ID    written")
     print("  ✓ NOTION_DAILY_DB_ID   written")
-    print("  ✓ NOTION_WORKOUT_DB_ID written")
 
     print(
         "\n── Setup complete ─────────────────────────────────────────\n"
         "\nYour Notion workspace now has:\n"
         "  • 'Food Entries' database  (logs each meal)\n"
         "  • 'Daily Log' database     (auto-totals macros per day)\n"
-        "  • 'Workout Log' database   (logs each workout entry)\n"
         "\nNext steps:\n"
         "  1. Make sure your .env has TELEGRAM_BOT_TOKEN and GEMINI_API_KEY set\n"
         "  2. Run:  python bot.py\n"
