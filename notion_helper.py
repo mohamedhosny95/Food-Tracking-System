@@ -15,7 +15,7 @@ _retry = retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, m
 notion = AsyncClient(auth=config.NOTION_API_KEY)
 
 
-# ── Daily Log ───────────────────────────────────────────────────────────────────────
+# ── Daily Log ──────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_or_create_daily_log(today: date) -> str:
@@ -118,7 +118,7 @@ async def get_fasting_status(today: date) -> bool:
         return False
 
 
-# ── Food Entries ───────────────────────────────────────────────────────────────────
+# ── Food Entries ─────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def create_food_entry(
@@ -158,10 +158,25 @@ async def create_food_entry(
             "files": [{"name": "food_photo.jpg", "external": {"url": photo_url}}]
         }
 
-    new_page = await notion.pages.create(
-        parent={"database_id": config.NOTION_FOOD_DB_ID},
-        properties=properties,
-    )
+    try:
+        new_page = await notion.pages.create(
+            parent={"database_id": config.NOTION_FOOD_DB_ID},
+            properties=properties,
+        )
+    except Exception as e:
+        # If Notion rejects because optional columns don't exist yet, retry without them
+        err_str = str(e).lower()
+        if "meal type" in err_str or "log method" in err_str or "validation" in err_str or "400" in err_str:
+            logger.warning("Notion rejected optional properties, retrying without Meal Type / Log Method: %s", e)
+            properties.pop("Meal Type", None)
+            properties.pop("Log Method", None)
+            new_page = await notion.pages.create(
+                parent={"database_id": config.NOTION_FOOD_DB_ID},
+                properties=properties,
+            )
+        else:
+            raise
+
     page_url: str = new_page.get("url", "")
     page_id: str = new_page.get("id", "")
     logger.info("Created Food Entry page: %s", page_url)
@@ -310,7 +325,7 @@ async def create_monthly_review_page(month_data: dict) -> str:
     return page_url
 
 
-# ── Saved Meals ───────────────────────────────────────────────────────────────────
+# ── Saved Meals ──────────────────────────────────────────────────────────────────────────────
 
 async def ensure_saved_meals_db() -> None:
     """
@@ -611,7 +626,7 @@ async def get_recent_meals(limit: int = 5) -> list[dict]:
     return meals
 
 
-# ── Restaurants ────────────────────────────────────────────────────────────────────
+# ── Restaurants ─────────────────────────────────────────────────────────────────────────────
 
 async def search_restaurants(query: str) -> list[dict]:
     """Returns restaurants whose name appears in the query string (case-insensitive)."""
@@ -655,7 +670,7 @@ async def add_restaurant(name: str, cuisine: str = "") -> str:
     return new_page.get("url", "")
 
 
-# ── Weekly Review ──────────────────────────────────────────────────────────────────
+# ── Weekly Review ──────────────────────────────────────────────────────────────────────────
 
 async def get_last_week_data() -> dict:
     """Returns daily averages and totals for the previous Mon–Sun week."""
@@ -753,7 +768,7 @@ async def create_weekly_review_page(week_data: dict) -> str:
     return page_url
 
 
-# ── Weight tracking ────────────────────────────────────────────────────────────────
+# ── Weight tracking ──────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def log_weight(weight_kg: float, today: date) -> None:
@@ -789,7 +804,7 @@ async def get_recent_weights(limit: int = 8) -> list[dict]:
     return results
 
 
-# ── Yesterday's meals ──────────────────────────────────────────────────────────────────
+# ── Yesterday's meals ────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_yesterday_meals() -> list[dict]:
@@ -879,7 +894,7 @@ async def get_today_food_entries(today: date) -> list[dict]:
     return entries
 
 
-# ── Chart data ───────────────────────────────────────────────────────────────────────
+# ── Chart data ─────────────────────────────────────────────────────────────────────────────
 
 @_retry
 async def get_daily_totals_range(start: date, end: date) -> list[dict]:
@@ -935,7 +950,7 @@ async def get_daily_totals_range(start: date, end: date) -> list[dict]:
     return result
 
 
-# ── User goals (persisted in Notion) ──────────────────────────────────────────────
+# ── User goals (persisted in Notion) ──────────────────────────────────────────────────────────
 
 _GOAL_PROPS = {
     "Goal Calories": "calories",
@@ -998,7 +1013,7 @@ async def save_user_goals(goals: dict) -> None:
         logger.warning("Could not save user goals to Notion: %s", exc)
 
 
-# ── Export data ──────────────────────────────────────────────────────────────────────
+# ── Export data ─────────────────────────────────────────────────────────────────────────────
 
 async def get_food_entries_range(start: date, end: date) -> list[dict]:
     """Returns all Food Entries between start and end dates (inclusive)."""
@@ -1054,7 +1069,7 @@ async def get_food_entries_range(start: date, end: date) -> list[dict]:
     return rows
 
 
-# ── Workout Log ──────────────────────────────────────────────────────────────────────────────
+# ── Workout Log ─────────────────────────────────────────────────────────────────────────────
 
 async def ensure_workout_db() -> str:
     """Auto-creates the Workout Log DB under NOTION_PARENT_PAGE_ID if not configured."""
