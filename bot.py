@@ -432,7 +432,6 @@ def _food_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📏 Weight",     callback_data="menu_food_weight"),
             InlineKeyboardButton("📆 Week",       callback_data="menu_food_week"),
         ],
-        [InlineKeyboardButton("↩️ Back",           callback_data="menu_main")],
     ])
 
 
@@ -2020,32 +2019,6 @@ async def goalweight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ── Menu system handlers ────────────────────────────────────────────────────────
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("Unauthorized.")
-        return
-    await update.message.reply_text(
-        "What would you like to track?",
-        reply_markup=_main_menu_keyboard(),
-    )
-
-
-async def menu_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "What would you like to track?",
-        reply_markup=_main_menu_keyboard(),
-    )
-
-
-async def menu_food_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("🍽️ Food Mode", reply_markup=_food_menu_keyboard())
-
-
-
 # Food menu action callbacks — each starts the right conversation state
 
 async def menu_food_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3489,7 +3462,6 @@ def main() -> None:
 
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([
-            BotCommand("menu",        "Open the food tracker menu"),
             BotCommand("log",         "Log a meal or water"),
             BotCommand("breakfast",   "Quick-log breakfast"),
             BotCommand("lunch",       "Quick-log lunch"),
@@ -3570,7 +3542,6 @@ def main() -> None:
             CommandHandler("snack",     quick_log_handler("Snack")),
             CommandHandler("templates", templates_handler),
             CommandHandler("goals",     goals_handler),
-            CommandHandler("menu",      menu_handler),
             CallbackQueryHandler(summary_quick_water_callback, pattern="^summary_water$"),
             CallbackQueryHandler(summary_quick_log_callback,   pattern="^summary_log$"),
             CallbackQueryHandler(log_again_callback,        pattern="^log_again$"),
@@ -3662,9 +3633,6 @@ def main() -> None:
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("menu",    menu_handler))
-    app.add_handler(CallbackQueryHandler(menu_main_callback,         pattern="^menu_main$"))
-    app.add_handler(CallbackQueryHandler(menu_food_callback,         pattern="^menu_food$"))
     app.add_handler(CallbackQueryHandler(menu_food_summary_callback, pattern="^menu_food_summary$"))
     app.add_handler(CallbackQueryHandler(menu_food_today_callback,   pattern="^menu_food_today$"))
     app.add_handler(CallbackQueryHandler(menu_food_chart_callback,   pattern="^menu_food_chart$"))
