@@ -16,6 +16,7 @@ notion = AsyncClient(auth=config.NOTION_API_KEY)
 
 _FOOD_DB_PROPS: dict | None = None
 _DAILY_DB_PROPS: dict | None = None
+_SAVED_MEALS_DB_PROPS: dict | None = None
 
 
 async def _get_food_db_props() -> dict:
@@ -32,6 +33,16 @@ async def _get_daily_db_props(refresh: bool = False) -> dict:
         db = await notion.databases.retrieve(database_id=config.NOTION_DAILY_DB_ID)
         _DAILY_DB_PROPS = db.get("properties", {})
     return _DAILY_DB_PROPS
+
+
+async def _get_saved_meals_db_props(refresh: bool = False) -> dict:
+    global _SAVED_MEALS_DB_PROPS
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        return {}
+    if refresh or _SAVED_MEALS_DB_PROPS is None:
+        db = await notion.databases.retrieve(database_id=config.NOTION_SAVED_MEALS_DB_ID)
+        _SAVED_MEALS_DB_PROPS = db.get("properties", {})
+    return _SAVED_MEALS_DB_PROPS
 
 
 def _find_prop(props: dict, candidates: list[str], prop_type: str | None = None) -> str | None:
@@ -104,6 +115,14 @@ def _page_number(props: dict, candidates: list[str]) -> float:
 
 def _page_rich_text(props: dict, candidates: list[str]) -> str:
     for name in candidates:
+        blocks = props.get(name, {}).get("rich_text", [])
+        if blocks:
+            return (blocks[0].get("text") or {}).get("content", "")
+    lowered = {name.lower(): name for name in props}
+    for candidate in candidates:
+        name = lowered.get(candidate.lower())
+        if not name:
+            continue
         blocks = props.get(name, {}).get("rich_text", [])
         if blocks:
             return (blocks[0].get("text") or {}).get("content", "")
@@ -605,8 +624,75 @@ async def create_monthly_review_page(month_data: dict) -> str:
 
 # ── Saved Meals ──────────────────────────────────────────────────────────────────────────────────────────
 
+_SAVED_MEALS_DESIRED_PROPS = {
+    "Calories":     {"number": {"format": "number"}},
+    "Protein":      {"number": {"format": "number"}},
+    "Carbs":        {"number": {"format": "number"}},
+    "Fat":          {"number": {"format": "number"}},
+    "Fiber":        {"number": {"format": "number"}},
+    "Sugar":        {"number": {"format": "number"}},
+    "Sodium":       {"number": {"format": "number"}},
+    "Portion Size": {"rich_text": {}},
+    "Times Logged": {"number": {"format": "number"}},
+    "Meal Type": {"select": {"options": [
+        {"name": "Breakfast", "color": "yellow"},
+        {"name": "Lunch",     "color": "green"},
+        {"name": "Dinner",    "color": "blue"},
+        {"name": "Snack",     "color": "orange"},
+    ]}},
+}
+
+
+async def _ensure_saved_meals_schema() -> None:
+    global _SAVED_MEALS_DB_PROPS
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        return
+    try:
+        schema = await _get_saved_meals_db_props(refresh=True)
+        missing = _missing_props(schema, _SAVED_MEALS_DESIRED_PROPS)
+        if missing:
+            await notion.databases.update(database_id=config.NOTION_SAVED_MEALS_DB_ID, properties=missing)
+            _SAVED_MEALS_DB_PROPS = None
+            logger.info("Added %d missing columns to Saved Meals DB", len(missing))
+    except Exception as exc:
+        logger.warning("Could not repair Saved Meals DB schema: %s", exc)
+
+
+def _saved_meal_properties(
+    schema: dict,
+    nutrition: NutritionData,
+    title_key: str | None = None,
+    meal_type: str = "",
+    times_logged: int | None = None,
+) -> dict:
+    properties: dict = {}
+    if title_key:
+        properties[title_key] = {"title": [{"text": {"content": nutrition.food_name[:100]}}]}
+    _set_if_present(properties, schema, ["Calories"], {"number": round(nutrition.calories, 1)}, "number")
+    _set_if_present(properties, schema, ["Protein", "Protein (g)"], {"number": round(nutrition.protein_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Carbs", "Carbs (g)", "Carbohydrates"], {"number": round(nutrition.carbs_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Fat", "Fat (g)"], {"number": round(nutrition.fat_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Fiber", "Fiber (g)"], {"number": round(nutrition.fiber_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Sugar", "Sugar (g)"], {"number": round(nutrition.sugar_g, 1)}, "number")
+    _set_if_present(properties, schema, ["Sodium", "Sodium (mg)"], {"number": int(nutrition.sodium_mg)}, "number")
+    _set_if_present(
+        properties,
+        schema,
+        ["Portion Size", "Portion"],
+        {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
+        "rich_text",
+    )
+    if times_logged is not None:
+        _set_if_present(properties, schema, ["Times Logged"], {"number": times_logged}, "number")
+    if meal_type:
+        _set_if_present(properties, schema, ["Meal Type"], {"select": {"name": meal_type}}, "select")
+    return properties
+
+
 async def ensure_saved_meals_db() -> None:
+    global _SAVED_MEALS_DB_PROPS
     if config.NOTION_SAVED_MEALS_DB_ID:
+        await _ensure_saved_meals_schema()
         return
     logger.info("NOTION_SAVED_MEALS_DB_ID not set — searching Notion for existing Saved Meals DB...")
     try:
@@ -620,6 +706,7 @@ async def ensure_saved_meals_db() -> None:
                 db_id = result["id"]
                 config.NOTION_SAVED_MEALS_DB_ID = db_id
                 logger.info("Found existing Saved Meals DB: %s", db_id)
+                await _ensure_saved_meals_schema()
                 return
     except Exception as exc:
         logger.warning("Notion search for Saved Meals DB failed: %s", exc)
@@ -634,25 +721,12 @@ async def ensure_saved_meals_db() -> None:
             title=[{"type": "text", "text": {"content": "Saved Meals"}}],
             properties={
                 "Name":         {"title": {}},
-                "Calories":     {"number": {"format": "number"}},
-                "Protein":      {"number": {"format": "number"}},
-                "Carbs":        {"number": {"format": "number"}},
-                "Fat":          {"number": {"format": "number"}},
-                "Fiber":        {"number": {"format": "number"}},
-                "Sugar":        {"number": {"format": "number"}},
-                "Sodium":       {"number": {"format": "number"}},
-                "Portion Size": {"rich_text": {}},
-                "Times Logged": {"number": {"format": "number"}},
-                "Meal Type": {"select": {"options": [
-                    {"name": "Breakfast", "color": "yellow"},
-                    {"name": "Lunch",     "color": "green"},
-                    {"name": "Dinner",    "color": "blue"},
-                    {"name": "Snack",     "color": "orange"},
-                ]}},
+                **_SAVED_MEALS_DESIRED_PROPS,
             },
         )
         db_id = saved_meals_db["id"]
         config.NOTION_SAVED_MEALS_DB_ID = db_id
+        _SAVED_MEALS_DB_PROPS = None
         logger.info("Created Saved Meals DB: %s", db_id)
     except Exception as exc:
         logger.error("Failed to create Saved Meals DB: %s", exc)
@@ -662,23 +736,38 @@ async def ensure_saved_meals_db() -> None:
 async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> str:
     if not config.NOTION_SAVED_MEALS_DB_ID:
         return ""
+    try:
+        schema = await _get_saved_meals_db_props()
+        title_key = _find_title_prop(schema, db_label="Saved Meals database")
+    except Exception:
+        logger.warning("Could not load Saved Meals schema, using hardcoded property names")
+        schema = {}
+        title_key = "Name"
+
     response = await notion.databases.query(
         database_id=config.NOTION_SAVED_MEALS_DB_ID,
-        filter={"property": "Name", "title": {"equals": nutrition.food_name[:100]}},
+        filter={"property": title_key, "title": {"equals": nutrition.food_name[:100]}},
     )
     active_page = next((p for p in response["results"] if not p.get("archived") and not p.get("in_trash")), None)
     if active_page:
         page_id = active_page["id"]
         times = int(active_page["properties"].get("Times Logged", {}).get("number") or 1) + 1
-        await notion.pages.update(page_id=page_id, properties={"Times Logged": {"number": times}})
+        if schema:
+            properties = {}
+            _set_if_present(properties, schema, ["Times Logged"], {"number": times}, "number")
+        else:
+            properties = {"Times Logged": {"number": times}}
+        if properties:
+            await notion.pages.update(page_id=page_id, properties=properties)
         return active_page.get("url", "")
 
     archived_page = next((p for p in response["results"] if p.get("archived") or p.get("in_trash")), None)
     if archived_page:
         page_id = archived_page["id"]
-        await notion.pages.update(
-            page_id=page_id, archived=False,
-            properties={
+        if schema:
+            properties = _saved_meal_properties(schema, nutrition, meal_type=meal_type, times_logged=1)
+        else:
+            properties = {
                 "Calories":     {"number": round(nutrition.calories, 1)},
                 "Protein":      {"number": round(nutrition.protein_g, 1)},
                 "Carbs":        {"number": round(nutrition.carbs_g, 1)},
@@ -688,24 +777,34 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
                 "Sodium":       {"number": int(nutrition.sodium_mg)},
                 "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
                 "Times Logged": {"number": 1},
-            },
+            }
+            if meal_type:
+                properties["Meal Type"] = {"select": {"name": meal_type}}
+        await notion.pages.update(
+            page_id=page_id, archived=False,
+            properties=properties,
         )
         return archived_page.get("url", "")
 
-    properties: dict = {
-        "Name":         {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
-        "Calories":     {"number": round(nutrition.calories, 1)},
-        "Protein":      {"number": round(nutrition.protein_g, 1)},
-        "Carbs":        {"number": round(nutrition.carbs_g, 1)},
-        "Fat":          {"number": round(nutrition.fat_g, 1)},
-        "Fiber":        {"number": round(nutrition.fiber_g, 1)},
-        "Sugar":        {"number": round(nutrition.sugar_g, 1)},
-        "Sodium":       {"number": int(nutrition.sodium_mg)},
-        "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
-        "Times Logged": {"number": 1},
-    }
-    if meal_type:
-        properties["Meal Type"] = {"select": {"name": meal_type}}
+    if schema:
+        properties = _saved_meal_properties(
+            schema, nutrition, title_key=title_key, meal_type=meal_type, times_logged=1
+        )
+    else:
+        properties = {
+            "Name":         {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
+            "Calories":     {"number": round(nutrition.calories, 1)},
+            "Protein":      {"number": round(nutrition.protein_g, 1)},
+            "Carbs":        {"number": round(nutrition.carbs_g, 1)},
+            "Fat":          {"number": round(nutrition.fat_g, 1)},
+            "Fiber":        {"number": round(nutrition.fiber_g, 1)},
+            "Sugar":        {"number": round(nutrition.sugar_g, 1)},
+            "Sodium":       {"number": int(nutrition.sodium_mg)},
+            "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
+            "Times Logged": {"number": 1},
+        }
+        if meal_type:
+            properties["Meal Type"] = {"select": {"name": meal_type}}
     new_page = await notion.pages.create(parent={"database_id": config.NOTION_SAVED_MEALS_DB_ID}, properties=properties)
     return new_page.get("url", "")
 
@@ -721,11 +820,15 @@ async def delete_saved_meal(page_id: str) -> None:
 async def get_saved_meals(limit: int = 20) -> list[dict]:
     if not config.NOTION_SAVED_MEALS_DB_ID:
         return await get_recent_meals(limit)
-    response = await notion.databases.query(
-        database_id=config.NOTION_SAVED_MEALS_DB_ID,
-        sorts=[{"property": "Times Logged", "direction": "descending"}],
-        page_size=limit,
-    )
+    try:
+        schema = await _get_saved_meals_db_props()
+    except Exception:
+        schema = {}
+    kwargs: dict = {"database_id": config.NOTION_SAVED_MEALS_DB_ID, "page_size": limit}
+    times_prop = _find_prop(schema, ["Times Logged"], "number") if schema else None
+    if times_prop:
+        kwargs["sorts"] = [{"property": times_prop, "direction": "descending"}]
+    response = await notion.databases.query(**kwargs)
     meals = []
     for page in response["results"]:
         if page.get("archived", False) or page.get("in_trash", False):

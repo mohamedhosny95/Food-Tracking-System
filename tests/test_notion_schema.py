@@ -82,10 +82,15 @@ class FakeDatabases:
 class FakePages:
     def __init__(self):
         self.created = []
+        self.updated = []
 
     async def create(self, **kwargs):
         self.created.append(kwargs)
         return {"url": "https://notion.test/page", "id": "page-id"}
+
+    async def update(self, **kwargs):
+        self.updated.append(kwargs)
+        return {"url": "https://notion.test/page", "id": kwargs.get("page_id", "page-id")}
 
 
 class FakeNotion:
@@ -253,6 +258,60 @@ class NotionDailyLogSchemaTests(unittest.IsolatedAsyncioTestCase):
         props = fake.pages.created[0]["properties"]
         self.assertIn("Day", props)
         self.assertIn("Date", props)
+
+
+class NotionSavedMealsSchemaTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        notion_helper._FOOD_DB_PROPS = None
+        notion_helper._DAILY_DB_PROPS = None
+        notion_helper._SAVED_MEALS_DB_PROPS = None
+
+    async def test_save_to_saved_meals_uses_existing_title_and_legacy_protein(self):
+        fake = FakeNotion({
+            "Meal": _prop("title"),
+            "Calories": _prop("number"),
+            "Protein (g)": _prop("number"),
+            "Times Logged": _prop("number"),
+        })
+        old_notion = notion_helper.notion
+        old_db_id = notion_helper.config.NOTION_SAVED_MEALS_DB_ID
+        notion_helper.notion = fake
+        notion_helper.config.NOTION_SAVED_MEALS_DB_ID = "saved-db"
+        try:
+            url = await notion_helper.save_to_saved_meals(
+                NutritionData(food_name="Chicken bowl", calories=450, protein_g=32),
+                meal_type="Lunch",
+            )
+        finally:
+            notion_helper.notion = old_notion
+            notion_helper.config.NOTION_SAVED_MEALS_DB_ID = old_db_id
+
+        self.assertEqual(url, "https://notion.test/page")
+        self.assertEqual(fake.databases.last_query["filter"]["property"], "Meal")
+        props = fake.pages.created[0]["properties"]
+        self.assertIn("Meal", props)
+        self.assertIn("Protein (g)", props)
+        self.assertNotIn("Protein", props)
+        self.assertNotIn("Meal Type", props)
+
+    async def test_existing_saved_meals_db_gets_missing_columns(self):
+        fake = FakeNotion({
+            "Name": _prop("title"),
+            "Calories": _prop("number"),
+        })
+        old_notion = notion_helper.notion
+        old_db_id = notion_helper.config.NOTION_SAVED_MEALS_DB_ID
+        notion_helper.notion = fake
+        notion_helper.config.NOTION_SAVED_MEALS_DB_ID = "saved-db"
+        try:
+            await notion_helper.ensure_saved_meals_db()
+        finally:
+            notion_helper.notion = old_notion
+            notion_helper.config.NOTION_SAVED_MEALS_DB_ID = old_db_id
+
+        updated = fake.databases.updated[0]["properties"]
+        self.assertIn("Protein", updated)
+        self.assertIn("Times Logged", updated)
 
 
 if __name__ == "__main__":

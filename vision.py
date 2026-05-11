@@ -357,6 +357,29 @@ def _scrape_fields(text: str) -> dict | None:
     return result if result else None
 
 
+def _coerce_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.lower() in {"n/a", "na", "none", "null", "unknown"}:
+        return default
+    match = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not match:
+        return default
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return default
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    return int(round(_coerce_float(value, float(default))))
+
+
 def _parse_nutrition_response(raw_text: str) -> NutritionData:
     data: dict | None = None
 
@@ -393,7 +416,7 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
         raise RuntimeError("AI returned an unreadable response. Please try again.")
 
     # Derive confidence_pct from confidence string if AI didn't return it
-    raw_pct = int(data.get("confidence_pct", 0) or 0)
+    raw_pct = _coerce_int(data.get("confidence_pct"), 0)
     if raw_pct == 0:
         raw_pct = {"High": 90, "Medium": 68, "Low": 40}.get(
             str(data.get("confidence", "Low")), 0
@@ -407,17 +430,17 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
     return NutritionData(
         food_name=str(data.get("food_name") or "Unknown Food"),
         portion_size=str(data.get("portion_size") or "Unknown"),
-        calories=float(data.get("calories") or 0),
-        protein_g=float(data.get("protein_g") or 0),
-        carbs_g=float(data.get("carbs_g") or 0),
-        fat_g=float(data.get("fat_g") or 0),
-        fiber_g=float(data.get("fiber_g") or 0),
-        sugar_g=float(data.get("sugar_g") or 0),
-        sodium_mg=float(data.get("sodium_mg") or 0),
+        calories=_coerce_float(data.get("calories")),
+        protein_g=_coerce_float(data.get("protein_g")),
+        carbs_g=_coerce_float(data.get("carbs_g")),
+        fat_g=_coerce_float(data.get("fat_g")),
+        fiber_g=_coerce_float(data.get("fiber_g")),
+        sugar_g=_coerce_float(data.get("sugar_g")),
+        sodium_mg=_coerce_float(data.get("sodium_mg")),
         confidence=str(data.get("confidence") or "Low"),
         confidence_pct=raw_pct,
         notes=notes,
         recognizable=bool(data.get("recognizable", True)),
         transcription=transcription,
-        estimated_weight_g=float(data.get("estimated_weight_g") or 0),
+        estimated_weight_g=_coerce_float(data.get("estimated_weight_g")),
     )
