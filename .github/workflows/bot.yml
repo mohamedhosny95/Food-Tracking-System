@@ -1,55 +1,18 @@
 name: Run Bot
 
-# Keeps the deployed Telegram bot refreshed after main updates.
-# Restart trigger: Codex stability fixes 2026-05-11.
 on:
   push:
-    branches: [main]          # restart immediately on every push to main
-  schedule:
-    - cron: '0 */5 * * *'   # restart every 5 hours (GitHub jobs max out at 6h)
-  workflow_dispatch:          # also allows manual "Run workflow" button
+    branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: bot-runner
-  cancel-in-progress: true   # cancel the old job the moment a new one starts
+  cancel-in-progress: true
 
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350      # 5h50m — safely under GitHub's 6h hard limit
-
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Restore bot state
-        uses: actions/cache/restore@v4
-        with:
-          path: bot_state.pkl
-          key: bot-state-never-match
-          restore-keys: bot-state-
-
-      - name: Start bot
-        run: python bot.py
-        env:
-          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GEMINI_API_KEY:           ${{ secrets.GEMINI_API_KEY }}
-          NOTION_API_KEY:           ${{ secrets.NOTION_API_KEY }}
-          NOTION_FOOD_DB_ID:        ${{ secrets.NOTION_FOOD_DB_ID }}
-          NOTION_DAILY_DB_ID:       ${{ secrets.NOTION_DAILY_DB_ID }}
-          NOTION_PARENT_PAGE_ID:    ${{ secrets.NOTION_PARENT_PAGE_ID }}
-          NOTION_SAVED_MEALS_DB_ID: ${{ secrets.NOTION_SAVED_MEALS_DB_ID }}
-          TIMEZONE_HOURS:           "3"
-
-      - name: Save bot state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: bot_state.pkl
-          key: bot-state-${{ github.run_id }}
+      - name: Release runner for repair publish
+        run: echo "Temporary no-op to cancel the previous long-running bot job."
