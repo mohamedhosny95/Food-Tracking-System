@@ -20,13 +20,21 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import re
           from pathlib import Path
-          text = Path('.github/workflows/codex-publish-ai-saved-meals.yml').read_text()
-          matches = re.findall(r"PATCH_B64\n(.*?)\n\s*PATCH_B64", text, re.S)
-          if not matches:
+          lines = Path('.github/workflows/codex-publish-ai-saved-meals.yml').read_text().splitlines()
+          payload_lines = []
+          collecting = False
+          for line in lines:
+              if not collecting and "<<'PATCH_B64'" in line:
+                  collecting = True
+                  continue
+              if collecting and line.strip() == 'PATCH_B64':
+                  break
+              if collecting:
+                  payload_lines.append(line)
+          if not payload_lines:
               raise SystemExit('patch payload markers not found')
-          payload = ''.join(matches[0].split())
+          payload = ''.join(''.join(payload_lines).split())
           Path('/tmp/codex.patch.b64').write_text(payload)
           PY
           base64 -d /tmp/codex.patch.b64 | gzip -dc > /tmp/codex.patch
