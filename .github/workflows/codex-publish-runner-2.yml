@@ -1,0 +1,51 @@
+name: Codex Publish Runner Retry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/codex-publish-runner-2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply stored Codex patch
+        run: |
+          git checkout 6e2c3c2 -- bot.py
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          source = Path('.github/workflows/codex-publish-patch.yml').read_text()
+          matches = dict(re.findall(r"cat > /tmp/(nonbot|bot)\.patch\.gz\.b64 <<'PATCH'\n(.*?)\n          PATCH", source, re.S))
+          if set(matches) != {'nonbot', 'bot'}:
+              raise SystemExit(f'Could not extract patch payloads: {matches.keys()}')
+          for name, body in matches.items():
+              compact = ''.join(body.split())
+              compact = compact.replace('Apppa', 'Appa').replace('JQRbmj4Isi', 'JQRbmj4mIsi')
+              Path(f'/tmp/{name}.patch.gz.b64').write_text(compact)
+          PY
+          base64 -d /tmp/nonbot.patch.gz.b64 | gunzip > /tmp/nonbot.patch
+          git apply --binary /tmp/nonbot.patch
+          base64 -d /tmp/bot.patch.gz.b64 | gunzip > /tmp/bot.patch
+          git apply --binary /tmp/bot.patch
+          rm -f .github/workflows/codex-publish-patch.yml .github/workflows/codex-publish-runner.yml .github/workflows/codex-publish-runner-2.yml
+      - name: Verify
+        run: |
+          python -m unittest discover
+          python -m py_compile bot.py config.py notion_helper.py setup_notion.py migrate_notion.py set_commands.py vision.py tests/test_bot_integrity.py tests/test_notion_schema.py
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Restore bot startup and harden Notion reads"
+          git push
