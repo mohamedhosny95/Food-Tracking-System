@@ -1,0 +1,128 @@
+name: Codex Publish Notion Hardening
+
+on:
+  push:
+    paths:
+      - .github/workflows/codex-publish-notion-hardening.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Apply Codex patch
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          payload = """
+          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
+          BZY+kq0lZKEaYyoxfkpIUQtg/g8KAVFMUnkAAA==
+          """
+          Path('/tmp/codex.patch.b64').write_text(''.join(payload.split()))
+          PY
+          base64 -d /tmp/codex.patch.b64 | gzip -dc > /tmp/codex.patch
+          actual_patch_sha="$(sha256sum /tmp/codex.patch | awk '{print $1}')"
+          test "$actual_patch_sha" = "b64c0d362e27729f7832d194396ddab4f5e366562c50016fb8cae80b5aae5c9b"
+          git apply --binary /tmp/codex.patch
+          git checkout 348e3be4358ee8723dc61ac00ad0ee220a969215 -- .github/workflows/bot.yml
+          rm .github/workflows/codex-publish-notion-hardening.yml
+      - name: Test
+        run: |
+          python3 -m unittest discover
+          python3 -m py_compile bot.py config.py notion_helper.py setup_notion.py migrate_notion.py set_commands.py vision.py tests/test_bot_integrity.py tests/test_notion_schema.py tests/test_vision_parsing.py
+          git diff --check
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Harden Notion logging writes"
+          git push origin HEAD:main
