@@ -1,6 +1,7 @@
 name: Run Bot
 
 # Keeps the deployed Telegram bot refreshed after main updates.
+# Restart trigger: Codex stability fixes 2026-05-11.
 on:
   push:
     branches: [main]          # restart immediately on every push to main
