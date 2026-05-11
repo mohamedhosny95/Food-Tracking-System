@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import os
 import sys
 import types
@@ -80,23 +81,31 @@ class FakeDatabases:
 
 
 class FakePages:
-    def __init__(self):
+    def __init__(self, create_errors: list[Exception] | None = None):
         self.created = []
         self.updated = []
+        self.create_errors = create_errors or []
 
     async def create(self, **kwargs):
-        self.created.append(kwargs)
+        self.created.append(copy.deepcopy(kwargs))
+        if self.create_errors:
+            raise self.create_errors.pop(0)
         return {"url": "https://notion.test/page", "id": "page-id"}
 
     async def update(self, **kwargs):
-        self.updated.append(kwargs)
+        self.updated.append(copy.deepcopy(kwargs))
         return {"url": "https://notion.test/page", "id": kwargs.get("page_id", "page-id")}
 
 
 class FakeNotion:
-    def __init__(self, schema: dict, query_results: list | None = None):
+    def __init__(
+        self,
+        schema: dict,
+        query_results: list | None = None,
+        create_errors: list[Exception] | None = None,
+    ):
         self.databases = FakeDatabases(schema, query_results)
-        self.pages = FakePages()
+        self.pages = FakePages(create_errors)
 
 
 class NotionFoodEntrySchemaTests(unittest.IsolatedAsyncioTestCase):
@@ -166,6 +175,68 @@ class NotionFoodEntrySchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Calories", props)
         self.assertNotIn("Daily Log", props)
         self.assertNotIn("Meal Type", props)
+
+    async def test_create_food_entry_retries_without_actual_optional_property_names(self):
+        fake = FakeNotion(
+            {
+                "Food": _prop("title"),
+                "Date": _prop("date"),
+                "Calories": _prop("number"),
+                "meal type": {"type": "select", "select": {"options": [{"name": "Lunch"}]}},
+                "log method": {"type": "select", "select": {"options": [{"name": "Photo"}]}},
+                "Confidence Level": {"type": "select", "select": {"options": [{"name": "High"}]}},
+                "Photo File": _prop("files"),
+            },
+            create_errors=[RuntimeError("400 validation property error")],
+        )
+        old_notion = notion_helper.notion
+        notion_helper.notion = fake
+        try:
+            await notion_helper.create_food_entry(
+                NutritionData(food_name="Apple", calories=95),
+                "https://example.com/photo.jpg",
+                "daily-page-id",
+                date(2026, 5, 10),
+                meal_type="Lunch",
+                log_method="Photo",
+            )
+        finally:
+            notion_helper.notion = old_notion
+
+        self.assertEqual(len(fake.pages.created), 2)
+        retry_props = fake.pages.created[1]["properties"]
+        self.assertIn("Food", retry_props)
+        self.assertIn("Calories", retry_props)
+        self.assertNotIn("meal type", retry_props)
+        self.assertNotIn("log method", retry_props)
+        self.assertNotIn("Confidence Level", retry_props)
+        self.assertNotIn("Photo File", retry_props)
+
+    async def test_create_food_entry_skips_wrong_daily_relation_target(self):
+        fake = FakeNotion({
+            "Name": _prop("title"),
+            "Daily Log": {
+                "type": "relation",
+                "relation": {"database_id": "some-other-db"},
+            },
+        })
+        old_notion = notion_helper.notion
+        old_daily_id = notion_helper.config.NOTION_DAILY_DB_ID
+        notion_helper.notion = fake
+        notion_helper.config.NOTION_DAILY_DB_ID = "daily-db"
+        try:
+            await notion_helper.create_food_entry(
+                NutritionData(food_name="Apple", calories=95),
+                "",
+                "daily-page-id",
+                date(2026, 5, 10),
+            )
+        finally:
+            notion_helper.notion = old_notion
+            notion_helper.config.NOTION_DAILY_DB_ID = old_daily_id
+
+        props = fake.pages.created[0]["properties"]
+        self.assertNotIn("Daily Log", props)
 
 
 class NotionTodayEntryMappingTests(unittest.TestCase):
@@ -258,6 +329,55 @@ class NotionDailyLogSchemaTests(unittest.IsolatedAsyncioTestCase):
         props = fake.pages.created[0]["properties"]
         self.assertIn("Day", props)
         self.assertIn("Date", props)
+
+    async def test_daily_log_retries_title_only_if_date_property_rejected(self):
+        fake = FakeNotion(
+            {
+                "Day": _prop("title"),
+                "Date": _prop("date"),
+            },
+            create_errors=[RuntimeError("validation property error")],
+        )
+        old_notion = notion_helper.notion
+        notion_helper.notion = fake
+        try:
+            page_id = await notion_helper.get_or_create_daily_log(date(2026, 5, 10))
+        finally:
+            notion_helper.notion = old_notion
+
+        self.assertEqual(page_id, "page-id")
+        self.assertEqual(len(fake.pages.created), 2)
+        self.assertIn("Date", fake.pages.created[0]["properties"])
+        self.assertNotIn("Date", fake.pages.created[1]["properties"])
+
+    async def test_schema_repair_adds_missing_select_options(self):
+        fake = FakeNotion({
+            "Name": _prop("title"),
+            "Date": _prop("date"),
+            "Calories": _prop("number"),
+            "Log Method": {
+                "type": "select",
+                "select": {"options": [{"name": "Photo", "color": "purple"}]},
+            },
+            "Meal Type": {
+                "type": "select",
+                "select": {"options": [{"name": "Breakfast", "color": "yellow"}]},
+            },
+        })
+        old_notion = notion_helper.notion
+        notion_helper.notion = fake
+        try:
+            await notion_helper.ensure_notion_schema()
+        finally:
+            notion_helper.notion = old_notion
+
+        all_updates = {}
+        for update in fake.databases.updated:
+            all_updates.update(update["properties"])
+        log_options = all_updates["Log Method"]["select"]["options"]
+        meal_options = all_updates["Meal Type"]["select"]["options"]
+        self.assertIn("Template", {option["name"] for option in log_options})
+        self.assertIn("Lunch", {option["name"] for option in meal_options})
 
 
 class NotionSavedMealsSchemaTests(unittest.IsolatedAsyncioTestCase):

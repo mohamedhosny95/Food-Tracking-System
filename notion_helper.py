@@ -1,4 +1,5 @@
 import logging
+import math
 from datetime import date, datetime, timedelta
 
 from notion_client import AsyncClient
@@ -19,9 +20,9 @@ _DAILY_DB_PROPS: dict | None = None
 _SAVED_MEALS_DB_PROPS: dict | None = None
 
 
-async def _get_food_db_props() -> dict:
+async def _get_food_db_props(refresh: bool = False) -> dict:
     global _FOOD_DB_PROPS
-    if _FOOD_DB_PROPS is None:
+    if refresh or _FOOD_DB_PROPS is None:
         db = await notion.databases.retrieve(database_id=config.NOTION_FOOD_DB_ID)
         _FOOD_DB_PROPS = db.get("properties", {})
     return _FOOD_DB_PROPS
@@ -77,10 +78,99 @@ def _set_if_present(
     candidates: list[str],
     value: dict,
     prop_type: str | None = None,
-) -> None:
+) -> str | None:
     name = _find_prop(schema, candidates, prop_type)
     if name:
         target[name] = value
+    return name
+
+
+def _normalize_notion_id(value: str) -> str:
+    return (value or "").replace("-", "").lower()
+
+
+def _relation_points_to(prop: dict, database_id: str) -> bool:
+    related_id = prop.get("relation", {}).get("database_id", "")
+    if not related_id:
+        return True
+    return _normalize_notion_id(related_id) == _normalize_notion_id(database_id)
+
+
+def _set_relation_if_target(
+    target: dict,
+    schema: dict,
+    candidates: list[str],
+    page_id: str,
+    database_id: str,
+) -> str | None:
+    name = _find_prop(schema, candidates, "relation")
+    if not name or not _relation_points_to(schema.get(name, {}), database_id):
+        return None
+    target[name] = {"relation": [{"id": page_id}]}
+    return name
+
+
+def _set_select_if_allowed(target: dict, schema: dict, candidates: list[str], value: str) -> str | None:
+    if not value:
+        return None
+    name = _find_prop(schema, candidates, "select")
+    if not name:
+        return None
+    options = schema.get(name, {}).get("select", {}).get("options", [])
+    if options and value not in {opt.get("name") for opt in options}:
+        logger.warning("Skipping select value %r for %s because the option is not in Notion", value, name)
+        return None
+    target[name] = {"select": {"name": value}}
+    return name
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def _safe_number(value, digits: int = 1) -> float:
+    return round(_safe_float(value), digits)
+
+
+def _safe_int(value) -> int:
+    return int(round(_safe_float(value)))
+
+
+def _select_option_repairs(schema: dict, desired: dict) -> dict:
+    updates: dict = {}
+    for name, desired_prop in desired.items():
+        current = schema.get(name)
+        if current is None or current.get("type") != "select":
+            continue
+        desired_options = desired_prop.get("select", {}).get("options", [])
+        if not desired_options:
+            continue
+        current_options = current.get("select", {}).get("options", [])
+        current_names = {opt.get("name") for opt in current_options}
+        missing = [opt for opt in desired_options if opt.get("name") not in current_names]
+        if missing:
+            updates[name] = {"select": {"options": current_options + missing}}
+    return updates
+
+
+async def _query_all_database_pages(database_id: str, **kwargs) -> list[dict]:
+    pages: list[dict] = []
+    cursor = None
+    while True:
+        query_kwargs = dict(kwargs)
+        query_kwargs["database_id"] = database_id
+        query_kwargs["page_size"] = min(int(query_kwargs.get("page_size", 100) or 100), 100)
+        if cursor:
+            query_kwargs["start_cursor"] = cursor
+        response = await notion.databases.query(**query_kwargs)
+        pages.extend(response.get("results", []))
+        if not response.get("has_more"):
+            return pages
+        cursor = response.get("next_cursor")
 
 
 def _page_title(props: dict, candidates: list[str] | None = None) -> str:
@@ -144,7 +234,7 @@ async def ensure_notion_schema() -> None:
     # ── Step 1: Basic Food Entries columns (no relations) ───────────────────────
     try:
         food_schema = await _get_food_db_props()
-        basic_food = _missing_props(food_schema, {
+        desired_food = {
             "Date":         {"date": {}},
             "Calories":     {"number": {"format": "number"}},
             "Protein":      {"number": {"format": "number"}},
@@ -188,11 +278,14 @@ async def ensure_notion_schema() -> None:
                     ]
                 }
             },
-        })
-        if basic_food:
-            await notion.databases.update(database_id=config.NOTION_FOOD_DB_ID, properties=basic_food)
+        }
+        basic_food = _missing_props(food_schema, desired_food)
+        select_repairs = _select_option_repairs(food_schema, desired_food)
+        food_updates = {**basic_food, **select_repairs}
+        if food_updates:
+            await notion.databases.update(database_id=config.NOTION_FOOD_DB_ID, properties=food_updates)
             _FOOD_DB_PROPS = None
-            logger.info("Added %d missing columns to Food Entries DB", len(basic_food))
+            logger.info("Repaired %d columns/options in Food Entries DB", len(food_updates))
     except Exception:
         logger.exception("Could not add basic Food Entries columns")
 
@@ -295,8 +388,11 @@ async def get_or_create_daily_log(today: date) -> str:
     try:
         schema = await _get_daily_db_props()
         title_prop = _find_title_prop(schema, db_label="Daily Log database")
+        date_prop = _find_prop(schema, ["Date"], "date")
     except Exception:
+        schema = {}
         title_prop = "Name"
+        date_prop = "Date"
     response = await notion.databases.query(
         database_id=config.NOTION_DAILY_DB_ID,
         filter={"property": title_prop, "title": {"equals": date_str}},
@@ -306,13 +402,24 @@ async def get_or_create_daily_log(today: date) -> str:
         logger.info("Found existing Daily Log page for %s: %s", date_str, page_id)
         return page_id
 
-    new_page = await notion.pages.create(
-        parent={"database_id": config.NOTION_DAILY_DB_ID},
-        properties={
-            title_prop: {"title": [{"text": {"content": date_str}}]},
-            "Date": {"date": {"start": date_str}},
-        },
-    )
+    properties = {title_prop: {"title": [{"text": {"content": date_str}}]}}
+    if date_prop:
+        properties[date_prop] = {"date": {"start": date_str}}
+    try:
+        new_page = await notion.pages.create(
+            parent={"database_id": config.NOTION_DAILY_DB_ID},
+            properties=properties,
+        )
+    except Exception as exc:
+        if date_prop and ("validation" in str(exc).lower() or "property" in str(exc).lower()):
+            logger.warning("Daily Log Date property rejected by Notion; retrying with title only: %s", exc)
+            properties.pop(date_prop, None)
+            new_page = await notion.pages.create(
+                parent={"database_id": config.NOTION_DAILY_DB_ID},
+                properties=properties,
+            )
+        else:
+            raise
     page_id = new_page["id"]
     logger.info("Created new Daily Log page for %s: %s", date_str, page_id)
     return page_id
@@ -439,45 +546,51 @@ async def create_food_entry(
         title_key: {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
     }
 
+    optional_props: set[str] = set()
+
     if schema:
         _set_if_present(properties, schema, ["Date"], {"date": {"start": date_str}}, "date")
-        _set_if_present(properties, schema, ["Calories"], {"number": round(nutrition.calories, 1)}, "number")
-        _set_if_present(properties, schema, ["Protein", "Protein (g)"], {"number": round(nutrition.protein_g, 1)}, "number")
-        _set_if_present(properties, schema, ["Carbs", "Carbs (g)", "Carbohydrates"], {"number": round(nutrition.carbs_g, 1)}, "number")
-        _set_if_present(properties, schema, ["Fat", "Fat (g)"], {"number": round(nutrition.fat_g, 1)}, "number")
-        _set_if_present(properties, schema, ["Fiber", "Fiber (g)"], {"number": round(nutrition.fiber_g, 1)}, "number")
-        _set_if_present(properties, schema, ["Sugar", "Sugar (g)"], {"number": round(nutrition.sugar_g, 1)}, "number")
-        _set_if_present(properties, schema, ["Sodium", "Sodium (mg)"], {"number": int(nutrition.sodium_mg)}, "number")
+        _set_if_present(properties, schema, ["Calories"], {"number": _safe_number(nutrition.calories)}, "number")
+        _set_if_present(properties, schema, ["Protein", "Protein (g)"], {"number": _safe_number(nutrition.protein_g)}, "number")
+        _set_if_present(properties, schema, ["Carbs", "Carbs (g)", "Carbohydrates"], {"number": _safe_number(nutrition.carbs_g)}, "number")
+        _set_if_present(properties, schema, ["Fat", "Fat (g)"], {"number": _safe_number(nutrition.fat_g)}, "number")
+        _set_if_present(properties, schema, ["Fiber", "Fiber (g)"], {"number": _safe_number(nutrition.fiber_g)}, "number")
+        _set_if_present(properties, schema, ["Sugar", "Sugar (g)"], {"number": _safe_number(nutrition.sugar_g)}, "number")
+        _set_if_present(properties, schema, ["Sodium", "Sodium (mg)"], {"number": _safe_int(nutrition.sodium_mg)}, "number")
         _set_if_present(properties, schema, ["Portion Size", "Portion"], {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]}, "rich_text")
-        _set_if_present(properties, schema, ["Confidence"], {"select": {"name": nutrition.confidence}}, "select")
-        _set_if_present(properties, schema, ["Notes"], {"rich_text": [{"text": {"content": nutrition.notes[:2000]}}]}, "rich_text")
-        _set_if_present(properties, schema, ["Daily Log"], {"relation": [{"id": daily_log_id}]}, "relation")
-        if meal_type:
-            _set_if_present(properties, schema, ["Meal Type"], {"select": {"name": meal_type}}, "select")
-        if log_method:
-            _set_if_present(properties, schema, ["Log Method"], {"select": {"name": log_method}}, "select")
-        if photo_url and _find_prop(schema, ["Photo"], "files"):
-            properties[_find_prop(schema, ["Photo"], "files")] = {
+        confidence_prop = _set_select_if_allowed(properties, schema, ["Confidence"], nutrition.confidence)
+        notes_prop = _set_if_present(properties, schema, ["Notes"], {"rich_text": [{"text": {"content": nutrition.notes[:2000]}}]}, "rich_text")
+        relation_prop = _set_relation_if_target(properties, schema, ["Daily Log"], daily_log_id, config.NOTION_DAILY_DB_ID)
+        meal_prop = _set_select_if_allowed(properties, schema, ["Meal Type"], meal_type)
+        method_prop = _set_select_if_allowed(properties, schema, ["Log Method"], log_method)
+        photo_prop = _find_prop(schema, ["Photo"], "files")
+        if photo_url and photo_prop:
+            properties[photo_prop] = {
                 "files": [{"name": "food_photo.jpg", "external": {"url": photo_url}}]
             }
+        optional_props.update(name for name in [confidence_prop, notes_prop, relation_prop, meal_prop, method_prop, photo_prop] if name)
     else:
         # Hardcoded fallback when schema is unavailable
         properties["Date"]         = {"date": {"start": date_str}}
-        properties["Calories"]     = {"number": round(nutrition.calories, 1)}
-        properties["Protein"]      = {"number": round(nutrition.protein_g, 1)}
-        properties["Carbs"]        = {"number": round(nutrition.carbs_g, 1)}
-        properties["Fat"]          = {"number": round(nutrition.fat_g, 1)}
-        properties["Fiber"]        = {"number": round(nutrition.fiber_g, 1)}
-        properties["Sugar"]        = {"number": round(nutrition.sugar_g, 1)}
-        properties["Sodium"]       = {"number": int(nutrition.sodium_mg)}
+        properties["Calories"]     = {"number": _safe_number(nutrition.calories)}
+        properties["Protein"]      = {"number": _safe_number(nutrition.protein_g)}
+        properties["Carbs"]        = {"number": _safe_number(nutrition.carbs_g)}
+        properties["Fat"]          = {"number": _safe_number(nutrition.fat_g)}
+        properties["Fiber"]        = {"number": _safe_number(nutrition.fiber_g)}
+        properties["Sugar"]        = {"number": _safe_number(nutrition.sugar_g)}
+        properties["Sodium"]       = {"number": _safe_int(nutrition.sodium_mg)}
         properties["Portion Size"] = {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]}
         properties["Notes"]        = {"rich_text": [{"text": {"content": nutrition.notes[:2000]}}]}
         if meal_type:
             properties["Meal Type"] = {"select": {"name": meal_type}}
+            optional_props.add("Meal Type")
         if log_method:
             properties["Log Method"] = {"select": {"name": log_method}}
+            optional_props.add("Log Method")
         if photo_url:
             properties["Photo"] = {"files": [{"name": "food_photo.jpg", "external": {"url": photo_url}}]}
+            optional_props.add("Photo")
+        optional_props.update(["Notes"])
 
     try:
         new_page = await notion.pages.create(
@@ -489,12 +602,23 @@ async def create_food_entry(
         err = str(e).lower()
         if "400" in err or "validation" in err or "property" in err:
             logger.warning("Notion rejected some properties, retrying with core columns only: %s", e)
-            for key in ["Meal Type", "Log Method", "Photo", "Confidence", "Daily Log"]:
+            for key in optional_props:
                 properties.pop(key, None)
-            new_page = await notion.pages.create(
-                parent={"database_id": config.NOTION_FOOD_DB_ID},
-                properties=properties,
-            )
+            try:
+                new_page = await notion.pages.create(
+                    parent={"database_id": config.NOTION_FOOD_DB_ID},
+                    properties=properties,
+                )
+            except Exception as second_exc:
+                second_err = str(second_exc).lower()
+                if "400" in second_err or "validation" in second_err or "property" in second_err:
+                    logger.warning("Notion rejected core food columns, retrying with title only: %s", second_exc)
+                    new_page = await notion.pages.create(
+                        parent={"database_id": config.NOTION_FOOD_DB_ID},
+                        properties={title_key: {"title": [{"text": {"content": nutrition.food_name[:100]}}]}},
+                    )
+                else:
+                    raise
         else:
             raise
 
@@ -516,19 +640,19 @@ async def get_week_calorie_bank(calorie_goal: int = 0) -> dict:
     week_start = today - timedelta(days=today.weekday())
     days_elapsed = today.weekday() + 1
 
-    response = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
+    pages = await _query_all_database_pages(
+        config.NOTION_FOOD_DB_ID,
         filter={
             "and": [
                 {"property": "Date", "date": {"on_or_after":  week_start.isoformat()}},
                 {"property": "Date", "date": {"on_or_before": today.isoformat()}},
             ]
         },
-        page_size=200,
+        page_size=100,
     )
     total_cal = sum(
         float(p["properties"].get("Calories", {}).get("number") or 0)
-        for p in response["results"]
+        for p in pages
     )
     goal = calorie_goal if calorie_goal > 0 else config.DAILY_CALORIES_GOAL
     expected = goal * days_elapsed
@@ -650,10 +774,12 @@ async def _ensure_saved_meals_schema() -> None:
     try:
         schema = await _get_saved_meals_db_props(refresh=True)
         missing = _missing_props(schema, _SAVED_MEALS_DESIRED_PROPS)
-        if missing:
-            await notion.databases.update(database_id=config.NOTION_SAVED_MEALS_DB_ID, properties=missing)
+        select_repairs = _select_option_repairs(schema, _SAVED_MEALS_DESIRED_PROPS)
+        updates = {**missing, **select_repairs}
+        if updates:
+            await notion.databases.update(database_id=config.NOTION_SAVED_MEALS_DB_ID, properties=updates)
             _SAVED_MEALS_DB_PROPS = None
-            logger.info("Added %d missing columns to Saved Meals DB", len(missing))
+            logger.info("Repaired %d columns/options in Saved Meals DB", len(updates))
     except Exception as exc:
         logger.warning("Could not repair Saved Meals DB schema: %s", exc)
 
@@ -668,13 +794,13 @@ def _saved_meal_properties(
     properties: dict = {}
     if title_key:
         properties[title_key] = {"title": [{"text": {"content": nutrition.food_name[:100]}}]}
-    _set_if_present(properties, schema, ["Calories"], {"number": round(nutrition.calories, 1)}, "number")
-    _set_if_present(properties, schema, ["Protein", "Protein (g)"], {"number": round(nutrition.protein_g, 1)}, "number")
-    _set_if_present(properties, schema, ["Carbs", "Carbs (g)", "Carbohydrates"], {"number": round(nutrition.carbs_g, 1)}, "number")
-    _set_if_present(properties, schema, ["Fat", "Fat (g)"], {"number": round(nutrition.fat_g, 1)}, "number")
-    _set_if_present(properties, schema, ["Fiber", "Fiber (g)"], {"number": round(nutrition.fiber_g, 1)}, "number")
-    _set_if_present(properties, schema, ["Sugar", "Sugar (g)"], {"number": round(nutrition.sugar_g, 1)}, "number")
-    _set_if_present(properties, schema, ["Sodium", "Sodium (mg)"], {"number": int(nutrition.sodium_mg)}, "number")
+    _set_if_present(properties, schema, ["Calories"], {"number": _safe_number(nutrition.calories)}, "number")
+    _set_if_present(properties, schema, ["Protein", "Protein (g)"], {"number": _safe_number(nutrition.protein_g)}, "number")
+    _set_if_present(properties, schema, ["Carbs", "Carbs (g)", "Carbohydrates"], {"number": _safe_number(nutrition.carbs_g)}, "number")
+    _set_if_present(properties, schema, ["Fat", "Fat (g)"], {"number": _safe_number(nutrition.fat_g)}, "number")
+    _set_if_present(properties, schema, ["Fiber", "Fiber (g)"], {"number": _safe_number(nutrition.fiber_g)}, "number")
+    _set_if_present(properties, schema, ["Sugar", "Sugar (g)"], {"number": _safe_number(nutrition.sugar_g)}, "number")
+    _set_if_present(properties, schema, ["Sodium", "Sodium (mg)"], {"number": _safe_int(nutrition.sodium_mg)}, "number")
     _set_if_present(
         properties,
         schema,
@@ -685,7 +811,7 @@ def _saved_meal_properties(
     if times_logged is not None:
         _set_if_present(properties, schema, ["Times Logged"], {"number": times_logged}, "number")
     if meal_type:
-        _set_if_present(properties, schema, ["Meal Type"], {"select": {"name": meal_type}}, "select")
+        _set_select_if_allowed(properties, schema, ["Meal Type"], meal_type)
     return properties
 
 
@@ -735,7 +861,9 @@ async def ensure_saved_meals_db() -> None:
 @_retry
 async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> str:
     if not config.NOTION_SAVED_MEALS_DB_ID:
-        return ""
+        await ensure_saved_meals_db()
+    if not config.NOTION_SAVED_MEALS_DB_ID:
+        raise RuntimeError("Saved Meals database is not configured or shared with the Notion integration.")
     try:
         schema = await _get_saved_meals_db_props()
         title_key = _find_title_prop(schema, db_label="Saved Meals database")
@@ -768,13 +896,13 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
             properties = _saved_meal_properties(schema, nutrition, meal_type=meal_type, times_logged=1)
         else:
             properties = {
-                "Calories":     {"number": round(nutrition.calories, 1)},
-                "Protein":      {"number": round(nutrition.protein_g, 1)},
-                "Carbs":        {"number": round(nutrition.carbs_g, 1)},
-                "Fat":          {"number": round(nutrition.fat_g, 1)},
-                "Fiber":        {"number": round(nutrition.fiber_g, 1)},
-                "Sugar":        {"number": round(nutrition.sugar_g, 1)},
-                "Sodium":       {"number": int(nutrition.sodium_mg)},
+                "Calories":     {"number": _safe_number(nutrition.calories)},
+                "Protein":      {"number": _safe_number(nutrition.protein_g)},
+                "Carbs":        {"number": _safe_number(nutrition.carbs_g)},
+                "Fat":          {"number": _safe_number(nutrition.fat_g)},
+                "Fiber":        {"number": _safe_number(nutrition.fiber_g)},
+                "Sugar":        {"number": _safe_number(nutrition.sugar_g)},
+                "Sodium":       {"number": _safe_int(nutrition.sodium_mg)},
                 "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
                 "Times Logged": {"number": 1},
             }
@@ -793,13 +921,13 @@ async def save_to_saved_meals(nutrition: NutritionData, meal_type: str = "") -> 
     else:
         properties = {
             "Name":         {"title": [{"text": {"content": nutrition.food_name[:100]}}]},
-            "Calories":     {"number": round(nutrition.calories, 1)},
-            "Protein":      {"number": round(nutrition.protein_g, 1)},
-            "Carbs":        {"number": round(nutrition.carbs_g, 1)},
-            "Fat":          {"number": round(nutrition.fat_g, 1)},
-            "Fiber":        {"number": round(nutrition.fiber_g, 1)},
-            "Sugar":        {"number": round(nutrition.sugar_g, 1)},
-            "Sodium":       {"number": int(nutrition.sodium_mg)},
+            "Calories":     {"number": _safe_number(nutrition.calories)},
+            "Protein":      {"number": _safe_number(nutrition.protein_g)},
+            "Carbs":        {"number": _safe_number(nutrition.carbs_g)},
+            "Fat":          {"number": _safe_number(nutrition.fat_g)},
+            "Fiber":        {"number": _safe_number(nutrition.fiber_g)},
+            "Sugar":        {"number": _safe_number(nutrition.sugar_g)},
+            "Sodium":       {"number": _safe_int(nutrition.sodium_mg)},
             "Portion Size": {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]},
             "Times Logged": {"number": 1},
         }
@@ -958,17 +1086,17 @@ async def get_last_week_data() -> dict:
     last_monday = today - timedelta(days=today.weekday() + 7)
     last_sunday = last_monday + timedelta(days=6)
     start_str, end_str = last_monday.isoformat(), last_sunday.isoformat()
-    response = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
+    pages = await _query_all_database_pages(
+        config.NOTION_FOOD_DB_ID,
         filter={"and": [
             {"property": "Date", "date": {"on_or_after": start_str}},
             {"property": "Date", "date": {"on_or_before": end_str}},
         ]},
-        page_size=200,
+        page_size=100,
     )
     totals: dict[str, float] = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "entries": 0}
     days_with_data: set[str] = set()
-    for page in response["results"]:
+    for page in pages:
         props = page["properties"]
         totals["calories"]  += _page_number(props, ["Calories"])
         totals["protein_g"] += _page_number(props, ["Protein", "Protein (g)"])
@@ -1124,16 +1252,16 @@ async def get_today_food_entries(today: date) -> list[dict]:
 @_retry
 async def get_daily_totals_range(start: date, end: date) -> list[dict]:
     # Aggregate Food Entries by date — no rollup dependency
-    food_resp = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
+    food_pages = await _query_all_database_pages(
+        config.NOTION_FOOD_DB_ID,
         filter={"and": [
             {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
             {"property": "Date", "date": {"on_or_before": end.isoformat()}},
         ]},
-        page_size=200,
+        page_size=100,
     )
     by_date: dict[date, dict] = {}
-    for page in food_resp["results"]:
+    for page in food_pages:
         props = page["properties"]
         date_raw = (props.get("Date", {}).get("date") or {}).get("start", "")
         if not date_raw:
