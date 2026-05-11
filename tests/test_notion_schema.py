@@ -201,6 +201,35 @@ class NotionTodayEntryMappingTests(unittest.TestCase):
         self.assertEqual(entries[0]["protein_g"], 18)
         self.assertEqual(entries[1]["protein_g"], 12)
 
+    def test_today_totals_reads_legacy_macro_names(self):
+        results = [
+            {
+                "id": "page-1",
+                "properties": {
+                    "Calories": {"number": 300},
+                    "Protein (g)": {"number": 22},
+                    "Carbs (g)": {"number": 35},
+                    "Fat (g)": {"number": 11},
+                    "Fiber (g)": {"number": 4},
+                    "Sugar (g)": {"number": 8},
+                    "Sodium (mg)": {"number": 550},
+                },
+            },
+        ]
+        fake = FakeNotion({"Name": _prop("title")}, results)
+        old_notion = notion_helper.notion
+        notion_helper.notion = fake
+        try:
+            totals = asyncio.run(notion_helper.get_today_totals(date(2026, 5, 10)))
+        finally:
+            notion_helper.notion = old_notion
+
+        self.assertEqual(totals["protein_g"], 22)
+        self.assertEqual(totals["carbs_g"], 35)
+        self.assertEqual(totals["fat_g"], 11)
+        self.assertEqual(totals["fiber_g"], 4)
+        self.assertEqual(totals["sodium_mg"], 550)
+
 
 class NotionDailyLogSchemaTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

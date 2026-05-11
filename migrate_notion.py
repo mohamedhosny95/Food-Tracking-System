@@ -49,6 +49,7 @@ async def migrate():
                         {"name": "Barcode",     "color": "blue"},
                         {"name": "Voice",       "color": "pink"},
                         {"name": "Re-log",      "color": "gray"},
+                        {"name": "Template",    "color": "brown"},
                     ]
                 }
             },

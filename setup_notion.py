@@ -102,6 +102,29 @@ async def setup() -> None:
             },
             "Notes": {"rich_text": {}},
             "Photo":  {"files": {}},
+            "Meal Type": {
+                "select": {
+                    "options": [
+                        {"name": "Breakfast", "color": "yellow"},
+                        {"name": "Lunch",     "color": "green"},
+                        {"name": "Dinner",    "color": "blue"},
+                        {"name": "Snack",     "color": "orange"},
+                    ]
+                }
+            },
+            "Log Method": {
+                "select": {
+                    "options": [
+                        {"name": "Photo",       "color": "purple"},
+                        {"name": "Restaurant",  "color": "red"},
+                        {"name": "Ingredients", "color": "green"},
+                        {"name": "Barcode",     "color": "blue"},
+                        {"name": "Voice",       "color": "pink"},
+                        {"name": "Re-log",      "color": "gray"},
+                        {"name": "Template",    "color": "brown"},
+                    ]
+                }
+            },
         },
     )
     food_db_id: str = food_db["id"]

@@ -72,6 +72,44 @@ def _set_if_present(
         target[name] = value
 
 
+def _page_title(props: dict, candidates: list[str] | None = None) -> str:
+    """Read the first available title property from a Notion page payload."""
+    for name in candidates or ["Name", "Food", "Title"]:
+        titles = props.get(name, {}).get("title", [])
+        if titles:
+            return (titles[0].get("text") or {}).get("content", "Unknown")
+    for prop in props.values():
+        titles = prop.get("title", [])
+        if titles:
+            return (titles[0].get("text") or {}).get("content", "Unknown")
+    return "Unknown"
+
+
+def _page_number(props: dict, candidates: list[str]) -> float:
+    """Read a numeric property, accepting current and legacy Notion names."""
+    for name in candidates:
+        value = props.get(name, {}).get("number")
+        if value is not None:
+            return float(value)
+    lowered = {name.lower(): name for name in props}
+    for candidate in candidates:
+        name = lowered.get(candidate.lower())
+        if not name:
+            continue
+        value = props.get(name, {}).get("number")
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
+def _page_rich_text(props: dict, candidates: list[str]) -> str:
+    for name in candidates:
+        blocks = props.get(name, {}).get("rich_text", [])
+        if blocks:
+            return (blocks[0].get("text") or {}).get("content", "")
+    return ""
+
+
 def _missing_props(schema: dict, desired: dict) -> dict:
     return {name: value for name, value in desired.items() if name not in schema}
 
@@ -127,6 +165,7 @@ async def ensure_notion_schema() -> None:
                         {"name": "Barcode",     "color": "blue"},
                         {"name": "Voice",       "color": "pink"},
                         {"name": "Re-log",      "color": "gray"},
+                        {"name": "Template",    "color": "brown"},
                     ]
                 }
             },
@@ -276,15 +315,13 @@ async def get_today_totals(today: date) -> dict:
     }
     for page in response["results"]:
         props = page["properties"]
-        def _n(k: str) -> float:
-            return float(props.get(k, {}).get("number") or 0)
-        totals["calories"]  += _n("Calories")
-        totals["protein_g"] += _n("Protein")
-        totals["carbs_g"]   += _n("Carbs")
-        totals["fat_g"]     += _n("Fat")
-        totals["fiber_g"]   += _n("Fiber")
-        totals["sugar_g"]   += _n("Sugar")
-        totals["sodium_mg"] += _n("Sodium")
+        totals["calories"]  += _page_number(props, ["Calories"])
+        totals["protein_g"] += _page_number(props, ["Protein", "Protein (g)"])
+        totals["carbs_g"]   += _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"])
+        totals["fat_g"]     += _page_number(props, ["Fat", "Fat (g)"])
+        totals["fiber_g"]   += _page_number(props, ["Fiber", "Fiber (g)"])
+        totals["sugar_g"]   += _page_number(props, ["Sugar", "Sugar (g)"])
+        totals["sodium_mg"] += _page_number(props, ["Sodium", "Sodium (mg)"])
 
     # Water and weight still live in Daily Log
     water_ml = 0.0
@@ -512,13 +549,11 @@ async def get_last_month_data() -> dict:
     days_with_data: set[str] = set()
     for page in all_pages:
         props = page["properties"]
-        def _n(k: str) -> float:
-            return float(props.get(k, {}).get("number") or 0)
-        totals["calories"]  += _n("Calories")
-        totals["protein_g"] += _n("Protein")
-        totals["carbs_g"]   += _n("Carbs")
-        totals["fat_g"]     += _n("Fat")
-        totals["fiber_g"]   += _n("Fiber")
+        totals["calories"]  += _page_number(props, ["Calories"])
+        totals["protein_g"] += _page_number(props, ["Protein", "Protein (g)"])
+        totals["carbs_g"]   += _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"])
+        totals["fat_g"]     += _page_number(props, ["Fat", "Fat (g)"])
+        totals["fiber_g"]   += _page_number(props, ["Fiber", "Fiber (g)"])
         totals["entries"]   += 1
         date_prop = props.get("Date", {}).get("date", {})
         if date_prop and date_prop.get("start"):
@@ -696,21 +731,19 @@ async def get_saved_meals(limit: int = 20) -> list[dict]:
         if page.get("archived", False) or page.get("in_trash", False):
             continue
         props = page["properties"]
-        titles = props.get("Name", {}).get("title", [])
-        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
-        def _num(key: str) -> float:
-            return float(props.get(key, {}).get("number") or 0)
-        def _text(key: str) -> str:
-            blocks = props.get(key, {}).get("rich_text", [])
-            return (blocks[0].get("text") or {}).get("content", "") if blocks else ""
+        name = _page_title(props)
         meals.append({
             "page_id": page["id"], "name": name,
-            "calories": _num("Calories"), "protein_g": _num("Protein"),
-            "carbs_g": _num("Carbs"), "fat_g": _num("Fat"),
-            "fiber_g": _num("Fiber"), "sugar_g": _num("Sugar"),
-            "sodium_mg": _num("Sodium"), "portion_size": _text("Portion Size"),
+            "calories": _page_number(props, ["Calories"]),
+            "protein_g": _page_number(props, ["Protein", "Protein (g)"]),
+            "carbs_g": _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"]),
+            "fat_g": _page_number(props, ["Fat", "Fat (g)"]),
+            "fiber_g": _page_number(props, ["Fiber", "Fiber (g)"]),
+            "sugar_g": _page_number(props, ["Sugar", "Sugar (g)"]),
+            "sodium_mg": _page_number(props, ["Sodium", "Sodium (mg)"]),
+            "portion_size": _page_rich_text(props, ["Portion Size", "Portion"]),
             "notes": "", "confidence": "High", "confidence_pct": 90,
-            "times_logged": int(_num("Times Logged")),
+            "times_logged": int(_page_number(props, ["Times Logged"])),
         })
     return meals
 
@@ -761,23 +794,21 @@ async def get_recent_meals(limit: int = 5) -> list[dict]:
     seen: set[str] = set()
     for page in response["results"]:
         props = page["properties"]
-        titles = props.get("Name", {}).get("title", [])
-        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
+        name = _page_title(props)
         if name in seen:
             continue
         seen.add(name)
-        def _num(key: str) -> float:
-            return float(props.get(key, {}).get("number") or 0)
-        def _text(key: str) -> str:
-            blocks = props.get(key, {}).get("rich_text", [])
-            return (blocks[0].get("text") or {}).get("content", "") if blocks else ""
         meals.append({
             "page_id": page["id"], "name": name,
-            "calories": _num("Calories"), "protein_g": _num("Protein"),
-            "carbs_g": _num("Carbs"), "fat_g": _num("Fat"),
-            "fiber_g": _num("Fiber"), "sugar_g": _num("Sugar"),
-            "sodium_mg": _num("Sodium"), "portion_size": _text("Portion Size"),
-            "notes": _text("Notes"),
+            "calories": _page_number(props, ["Calories"]),
+            "protein_g": _page_number(props, ["Protein", "Protein (g)"]),
+            "carbs_g": _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"]),
+            "fat_g": _page_number(props, ["Fat", "Fat (g)"]),
+            "fiber_g": _page_number(props, ["Fiber", "Fiber (g)"]),
+            "sugar_g": _page_number(props, ["Sugar", "Sugar (g)"]),
+            "sodium_mg": _page_number(props, ["Sodium", "Sodium (mg)"]),
+            "portion_size": _page_rich_text(props, ["Portion Size", "Portion"]),
+            "notes": _page_rich_text(props, ["Notes"]),
             "confidence": (props.get("Confidence", {}).get("select") or {}).get("name", "Medium"),
             "confidence_pct": 70, "times_logged": 0,
         })
@@ -836,13 +867,11 @@ async def get_last_week_data() -> dict:
     days_with_data: set[str] = set()
     for page in response["results"]:
         props = page["properties"]
-        def _n(k: str) -> float:
-            return float(props.get(k, {}).get("number") or 0)
-        totals["calories"]  += _n("Calories")
-        totals["protein_g"] += _n("Protein")
-        totals["carbs_g"]   += _n("Carbs")
-        totals["fat_g"]     += _n("Fat")
-        totals["fiber_g"]   += _n("Fiber")
+        totals["calories"]  += _page_number(props, ["Calories"])
+        totals["protein_g"] += _page_number(props, ["Protein", "Protein (g)"])
+        totals["carbs_g"]   += _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"])
+        totals["fat_g"]     += _page_number(props, ["Fat", "Fat (g)"])
+        totals["fiber_g"]   += _page_number(props, ["Fiber", "Fiber (g)"])
         totals["entries"]   += 1
         date_prop = props.get("Date", {}).get("date", {})
         if date_prop and date_prop.get("start"):
@@ -930,20 +959,18 @@ async def get_yesterday_meals() -> list[dict]:
     meals = []
     for page in response["results"]:
         props = page["properties"]
-        titles = props.get("Name", {}).get("title", [])
-        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
         meals.append({
-            "page_id": page["id"], "name": name,
-            "calories":  float(props.get("Calories",  {}).get("number") or 0),
-            "protein_g": float(props.get("Protein",   {}).get("number") or 0),
-            "carbs_g":   float(props.get("Carbs",     {}).get("number") or 0),
-            "fat_g":     float(props.get("Fat",       {}).get("number") or 0),
-            "fiber_g":   float(props.get("Fiber",     {}).get("number") or 0),
-            "sugar_g":   float(props.get("Sugar",     {}).get("number") or 0),
-            "sodium_mg": float(props.get("Sodium",    {}).get("number") or 0),
-            "portion_size": ((props.get("Portion Size", {}).get("rich_text") or [{}])[0].get("text", {}).get("content", "")),
+            "page_id": page["id"], "name": _page_title(props),
+            "calories":  _page_number(props, ["Calories"]),
+            "protein_g": _page_number(props, ["Protein", "Protein (g)"]),
+            "carbs_g":   _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"]),
+            "fat_g":     _page_number(props, ["Fat", "Fat (g)"]),
+            "fiber_g":   _page_number(props, ["Fiber", "Fiber (g)"]),
+            "sugar_g":   _page_number(props, ["Sugar", "Sugar (g)"]),
+            "sodium_mg": _page_number(props, ["Sodium", "Sodium (mg)"]),
+            "portion_size": _page_rich_text(props, ["Portion Size", "Portion"]),
             "meal_type": (props.get("Meal Type", {}).get("select") or {}).get("name", ""),
-            "notes":     ((props.get("Notes", {}).get("rich_text") or [{}])[0].get("text", {}).get("content", "")),
+            "notes":     _page_rich_text(props, ["Notes"]),
             "confidence": (props.get("Confidence", {}).get("select") or {}).get("name", "Medium"),
         })
     return meals
@@ -959,11 +986,9 @@ async def get_recent_food_entries(limit: int = 10) -> list[dict]:
     entries = []
     for page in response["results"]:
         props = page["properties"]
-        titles = props.get("Name", {}).get("title", [])
-        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
         entries.append({
-            "page_id": page["id"], "name": name,
-            "calories": float(props.get("Calories", {}).get("number") or 0),
+            "page_id": page["id"], "name": _page_title(props),
+            "calories": _page_number(props, ["Calories"]),
             "meal_type": (props.get("Meal Type", {}).get("select") or {}).get("name", ""),
             "date": (props.get("Date", {}).get("date") or {}).get("start", ""),
         })
@@ -982,13 +1007,10 @@ async def get_today_food_entries(today: date) -> list[dict]:
     entries = []
     for page in response["results"]:
         props = page["properties"]
-        titles = props.get("Name", {}).get("title", [])
-        name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
-        protein = props.get("Protein", {}).get("number") if props.get("Protein", {}).get("number") is not None else props.get("Protein (g)", {}).get("number") or 0
         entries.append({
-            "page_id": page["id"], "name": name,
-            "calories": float(props.get("Calories", {}).get("number") or 0),
-            "protein_g": float(protein or 0),
+            "page_id": page["id"], "name": _page_title(props),
+            "calories": _page_number(props, ["Calories"]),
+            "protein_g": _page_number(props, ["Protein", "Protein (g)"]),
             "meal_type": (props.get("Meal Type", {}).get("select") or {}).get("name", ""),
         })
     return entries
@@ -1022,11 +1044,11 @@ async def get_daily_totals_range(start: date, end: date) -> list[dict]:
                 "date": page_date, "calories": 0.0, "protein_g": 0.0,
                 "carbs_g": 0.0, "fat_g": 0.0, "fiber_g": 0.0, "water_ml": 0.0,
             }
-        by_date[page_date]["calories"]  += float(props.get("Calories", {}).get("number") or 0)
-        by_date[page_date]["protein_g"] += float(props.get("Protein",  {}).get("number") or 0)
-        by_date[page_date]["carbs_g"]   += float(props.get("Carbs",    {}).get("number") or 0)
-        by_date[page_date]["fat_g"]     += float(props.get("Fat",      {}).get("number") or 0)
-        by_date[page_date]["fiber_g"]   += float(props.get("Fiber",    {}).get("number") or 0)
+        by_date[page_date]["calories"]  += _page_number(props, ["Calories"])
+        by_date[page_date]["protein_g"] += _page_number(props, ["Protein", "Protein (g)"])
+        by_date[page_date]["carbs_g"]   += _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"])
+        by_date[page_date]["fat_g"]     += _page_number(props, ["Fat", "Fat (g)"])
+        by_date[page_date]["fiber_g"]   += _page_number(props, ["Fiber", "Fiber (g)"])
 
     # Overlay water_ml from Daily Log
     try:
@@ -1146,23 +1168,21 @@ async def get_food_entries_range(start: date, end: date) -> list[dict]:
         response = await notion.databases.query(**kwargs)
         for page in response["results"]:
             props = page["properties"]
-            titles = props.get("Name", {}).get("title", [])
-            name = (titles[0].get("text") or {}).get("content", "Unknown") if titles else "Unknown"
             date_val = (props.get("Date", {}).get("date") or {}).get("start", "")
             rows.append({
                 "date":       date_val,
                 "meal_type":  (props.get("Meal Type",  {}).get("select") or {}).get("name", ""),
                 "log_method": (props.get("Log Method", {}).get("select") or {}).get("name", ""),
-                "name":       name,
-                "calories":   props.get("Calories",  {}).get("number") or 0,
-                "protein_g":  props.get("Protein",   {}).get("number") or 0,
-                "carbs_g":    props.get("Carbs",     {}).get("number") or 0,
-                "fat_g":      props.get("Fat",       {}).get("number") or 0,
-                "fiber_g":    props.get("Fiber",     {}).get("number") or 0,
-                "sugar_g":    props.get("Sugar",     {}).get("number") or 0,
-                "sodium_mg":  props.get("Sodium",    {}).get("number") or 0,
-                "portion_size": ((props.get("Portion Size", {}).get("rich_text") or [{}])[0].get("text", {}).get("content", "")),
-                "notes": ((props.get("Notes", {}).get("rich_text") or [{}])[0].get("text", {}).get("content", "")),
+                "name":       _page_title(props),
+                "calories":   _page_number(props, ["Calories"]),
+                "protein_g":  _page_number(props, ["Protein", "Protein (g)"]),
+                "carbs_g":    _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"]),
+                "fat_g":      _page_number(props, ["Fat", "Fat (g)"]),
+                "fiber_g":    _page_number(props, ["Fiber", "Fiber (g)"]),
+                "sugar_g":    _page_number(props, ["Sugar", "Sugar (g)"]),
+                "sodium_mg":  _page_number(props, ["Sodium", "Sodium (mg)"]),
+                "portion_size": _page_rich_text(props, ["Portion Size", "Portion"]),
+                "notes": _page_rich_text(props, ["Notes"]),
             })
         if not response.get("has_more"):
             break
