@@ -1,0 +1,48 @@
+name: Codex Repair Publish
+
+on:
+  push:
+    paths:
+      - .github/workflows/codex-repair-publish.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Extract and apply payload
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('.github/workflows/codex-publish-ai-saved-meals.yml').read_text()
+          matches = re.findall(r"PATCH_B64\n(.*?)\n\s*PATCH_B64", text, re.S)
+          if not matches:
+              raise SystemExit('patch payload markers not found')
+          payload = ''.join(matches[0].split())
+          Path('/tmp/codex.patch.b64').write_text(payload)
+          PY
+          base64 -d /tmp/codex.patch.b64 | gzip -dc > /tmp/codex.patch
+          actual_patch_sha="$(sha256sum /tmp/codex.patch | awk '{print $1}')"
+          test "$actual_patch_sha" = "b4f9f956edb404b2893457ae79367ff4b8ba8413272c6073aca3001c8da71970"
+          git apply --binary /tmp/codex.patch
+          rm .github/workflows/codex-publish-ai-saved-meals.yml .github/workflows/codex-repair-publish.yml
+      - name: Test
+        run: |
+          python3 -m unittest discover
+          python3 -m py_compile bot.py config.py notion_helper.py setup_notion.py migrate_notion.py set_commands.py vision.py tests/test_bot_integrity.py tests/test_notion_schema.py tests/test_vision_parsing.py
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Harden AI parsing and saved meal schema"
+          git push origin HEAD:main
