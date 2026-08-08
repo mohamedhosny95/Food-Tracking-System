@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 from datetime import date, datetime, timedelta
@@ -382,6 +383,25 @@ async def ensure_notion_schema() -> None:
 
 # ── Daily Log ──────────────────────────────────────────────────────────────────────────────────────
 
+async def _daily_log_title_prop() -> str:
+    """Title property of the Daily Log DB, falling back to 'Name' if unreadable."""
+    try:
+        schema = await _get_daily_db_props()
+        return _find_title_prop(schema, db_label="Daily Log database")
+    except Exception:
+        return "Name"
+
+
+async def _find_daily_log_page(title: str) -> dict | None:
+    """Look up a Daily Log row by its title (a date string, or the goals page name)."""
+    response = await notion.databases.query(
+        database_id=config.NOTION_DAILY_DB_ID,
+        filter={"property": await _daily_log_title_prop(), "title": {"equals": title}},
+    )
+    results = response["results"]
+    return results[0] if results else None
+
+
 @_retry
 async def get_or_create_daily_log(today: date) -> str:
     date_str = today.isoformat()
@@ -425,21 +445,13 @@ async def get_or_create_daily_log(today: date) -> str:
     return page_id
 
 
-@_retry
-async def get_today_totals(today: date) -> dict:
-    date_str = today.isoformat()
-
-    # Sum directly from Food Entries — no rollup dependency
-    response = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
-        filter={"property": "Date", "date": {"equals": date_str}},
-        page_size=100,
-    )
+def _sum_macros(pages: list[dict]) -> dict[str, float]:
+    """Sum the macro columns of a list of Food Entries pages."""
     totals: dict[str, float] = {
         "calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0,
         "fat_g": 0.0, "fiber_g": 0.0, "sugar_g": 0.0, "sodium_mg": 0.0,
     }
-    for page in response["results"]:
+    for page in pages:
         props = page["properties"]
         totals["calories"]  += _page_number(props, ["Calories"])
         totals["protein_g"] += _page_number(props, ["Protein", "Protein (g)"])
@@ -448,28 +460,40 @@ async def get_today_totals(today: date) -> dict:
         totals["fiber_g"]   += _page_number(props, ["Fiber", "Fiber (g)"])
         totals["sugar_g"]   += _page_number(props, ["Sugar", "Sugar (g)"])
         totals["sodium_mg"] += _page_number(props, ["Sodium", "Sodium (mg)"])
+    return totals
 
-    # Water and weight still live in Daily Log
-    water_ml = 0.0
-    weight_kg = 0.0
+
+async def _today_water_and_weight(date_str: str) -> tuple[float, float]:
+    """Water/weight for a day — best effort, never raises."""
     try:
-        try:
-            schema = await _get_daily_db_props()
-            title_prop = _find_title_prop(schema, db_label="Daily Log database")
-        except Exception:
-            title_prop = "Name"
-        dl_resp = await notion.databases.query(
-            database_id=config.NOTION_DAILY_DB_ID,
-            filter={"property": title_prop, "title": {"equals": date_str}},
+        page = await _find_daily_log_page(date_str)
+        if not page:
+            return 0.0, 0.0
+        props = page["properties"]
+        return (
+            float(props.get("Water (ml)",  {}).get("number") or 0),
+            float(props.get("Weight (kg)", {}).get("number") or 0),
         )
-        if dl_resp["results"]:
-            dl_props = dl_resp["results"][0]["properties"]
-            water_ml  = float(dl_props.get("Water (ml)",  {}).get("number") or 0)
-            weight_kg = float(dl_props.get("Weight (kg)", {}).get("number") or 0)
     except Exception:
-        pass
+        return 0.0, 0.0
 
-    return {**totals, "water_ml": water_ml, "weight_kg": weight_kg}
+
+@_retry
+async def get_today_totals(today: date) -> dict:
+    date_str = today.isoformat()
+
+    # Food Entries (macros) and Daily Log (water/weight) live in different
+    # databases, so both round-trips run concurrently.
+    pages, (water_ml, weight_kg) = await asyncio.gather(
+        _query_all_database_pages(
+            config.NOTION_FOOD_DB_ID,
+            filter={"property": "Date", "date": {"equals": date_str}},
+            page_size=100,
+        ),
+        _today_water_and_weight(date_str),
+    )
+    # Sum directly from Food Entries — no rollup dependency
+    return {**_sum_macros(pages), "water_ml": water_ml, "weight_kg": weight_kg}
 
 
 @_retry
@@ -499,21 +523,11 @@ async def set_fasting_status(today: date, fasting: bool) -> None:
 
 
 async def get_fasting_status(today: date) -> bool:
-    date_str = today.isoformat()
     try:
-        try:
-            schema = await _get_daily_db_props()
-            title_prop = _find_title_prop(schema, db_label="Daily Log database")
-        except Exception:
-            title_prop = "Name"
-        response = await notion.databases.query(
-            database_id=config.NOTION_DAILY_DB_ID,
-            filter={"property": title_prop, "title": {"equals": date_str}},
-        )
-        if not response["results"]:
+        page = await _find_daily_log_page(today.isoformat())
+        if not page:
             return False
-        props = response["results"][0]["properties"]
-        return bool(props.get("Fasting", {}).get("checkbox", False))
+        return bool(page["properties"].get("Fasting", {}).get("checkbox", False))
     except Exception as exc:
         logger.warning("Could not read fasting status: %s", exc)
         return False
@@ -670,23 +684,16 @@ async def get_last_month_data() -> dict:
     last_month_end = first_this_month - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
 
-    query_filter = {
-        "and": [
-            {"property": "Date", "date": {"on_or_after":  last_month_start.isoformat()}},
-            {"property": "Date", "date": {"on_or_before": last_month_end.isoformat()}},
-        ]
-    }
-    all_pages = []
-    cursor = None
-    while True:
-        kwargs: dict = {"database_id": config.NOTION_FOOD_DB_ID, "filter": query_filter, "page_size": 100}
-        if cursor:
-            kwargs["start_cursor"] = cursor
-        response = await notion.databases.query(**kwargs)
-        all_pages.extend(response["results"])
-        if not response.get("has_more"):
-            break
-        cursor = response.get("next_cursor")
+    all_pages = await _query_all_database_pages(
+        config.NOTION_FOOD_DB_ID,
+        filter={
+            "and": [
+                {"property": "Date", "date": {"on_or_after":  last_month_start.isoformat()}},
+                {"property": "Date", "date": {"on_or_before": last_month_end.isoformat()}},
+            ]
+        },
+        page_size=100,
+    )
 
     totals: dict[str, float] = {"calories": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0, "fiber_g": 0, "entries": 0}
     days_with_data: set[str] = set()
@@ -981,6 +988,11 @@ async def get_saved_meals(limit: int = 20) -> list[dict]:
 
 @_retry
 async def get_streak() -> int:
+    """Count consecutive days ending today that have at least one food entry.
+
+    Entries are walked newest-first so the scan can stop at the first gap —
+    a broken streak costs a single page instead of the whole 90-day window.
+    """
     today = date.today()
     start = today - timedelta(days=90)
     query_filter = {
@@ -989,30 +1001,40 @@ async def get_streak() -> int:
             {"property": "Date", "date": {"on_or_before": today.isoformat()}},
         ]
     }
-    logged_dates: set[date] = set()
+    streak = 0
+    expected = today          # the date that must appear next to extend the streak
+    previous: date | None = None
     cursor = None
     while True:
-        kwargs: dict = {"database_id": config.NOTION_FOOD_DB_ID, "filter": query_filter, "page_size": 100}
+        kwargs: dict = {
+            "database_id": config.NOTION_FOOD_DB_ID,
+            "filter": query_filter,
+            "sorts": [{"property": "Date", "direction": "descending"}],
+            "page_size": 100,
+        }
         if cursor:
             kwargs["start_cursor"] = cursor
         response = await notion.databases.query(**kwargs)
         for page in response["results"]:
-            date_prop = (page["properties"].get("Date", {}).get("date") or {})
-            raw = date_prop.get("start", "")
-            if raw:
-                try:
-                    logged_dates.add(date.fromisoformat(raw))
-                except ValueError:
-                    pass
+            raw = (page["properties"].get("Date", {}).get("date") or {}).get("start", "")
+            if not raw:
+                continue
+            try:
+                logged = date.fromisoformat(raw)
+            except ValueError:
+                continue
+            if logged == previous:
+                continue          # several entries on the same day
+            previous = logged
+            if logged > expected:
+                continue          # future-dated entry — ignore
+            if logged != expected:
+                return streak     # gap reached, nothing older can extend it
+            streak += 1
+            expected = logged - timedelta(days=1)
         if not response.get("has_more"):
-            break
+            return streak
         cursor = response.get("next_cursor")
-    streak = 0
-    check = today
-    while check in logged_dates:
-        streak += 1
-        check -= timedelta(days=1)
-    return streak
 
 
 async def get_recent_meals(limit: int = 5) -> list[dict]:
@@ -1228,20 +1250,22 @@ async def get_recent_food_entries(limit: int = 10) -> list[dict]:
 
 @_retry
 async def get_today_food_entries(today: date) -> list[dict]:
-    date_str = today.isoformat()
-    response = await notion.databases.query(
-        database_id=config.NOTION_FOOD_DB_ID,
-        filter={"property": "Date", "date": {"equals": date_str}},
+    """Today's entries, with full macros so callers can total them without a second query."""
+    pages = await _query_all_database_pages(
+        config.NOTION_FOOD_DB_ID,
+        filter={"property": "Date", "date": {"equals": today.isoformat()}},
         sorts=[{"timestamp": "created_time", "direction": "ascending"}],
-        page_size=50,
+        page_size=100,
     )
     entries = []
-    for page in response["results"]:
+    for page in pages:
         props = page["properties"]
         entries.append({
             "page_id": page["id"], "name": _page_title(props),
             "calories": _page_number(props, ["Calories"]),
             "protein_g": _page_number(props, ["Protein", "Protein (g)"]),
+            "carbs_g": _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"]),
+            "fat_g": _page_number(props, ["Fat", "Fat (g)"]),
             "meal_type": (props.get("Meal Type", {}).get("select") or {}).get("name", ""),
         })
     return entries
@@ -1251,14 +1275,31 @@ async def get_today_food_entries(today: date) -> list[dict]:
 
 @_retry
 async def get_daily_totals_range(start: date, end: date) -> list[dict]:
+    date_range_filter = {"and": [
+        {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
+        {"property": "Date", "date": {"on_or_before": end.isoformat()}},
+    ]}
+
+    async def _daily_log_rows() -> list[dict]:
+        """Water comes from a different database — best effort, never raises."""
+        try:
+            response = await notion.databases.query(
+                database_id=config.NOTION_DAILY_DB_ID,
+                filter=date_range_filter,
+                page_size=100,
+            )
+            return response["results"]
+        except Exception:
+            return []
+
     # Aggregate Food Entries by date — no rollup dependency
-    food_pages = await _query_all_database_pages(
-        config.NOTION_FOOD_DB_ID,
-        filter={"and": [
-            {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
-            {"property": "Date", "date": {"on_or_before": end.isoformat()}},
-        ]},
-        page_size=100,
+    food_pages, daily_log_rows = await asyncio.gather(
+        _query_all_database_pages(
+            config.NOTION_FOOD_DB_ID,
+            filter=date_range_filter,
+            page_size=100,
+        ),
+        _daily_log_rows(),
     )
     by_date: dict[date, dict] = {}
     for page in food_pages:
@@ -1282,28 +1323,17 @@ async def get_daily_totals_range(start: date, end: date) -> list[dict]:
         by_date[page_date]["fiber_g"]   += _page_number(props, ["Fiber", "Fiber (g)"])
 
     # Overlay water_ml from Daily Log
-    try:
-        dl_resp = await notion.databases.query(
-            database_id=config.NOTION_DAILY_DB_ID,
-            filter={"and": [
-                {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
-                {"property": "Date", "date": {"on_or_before": end.isoformat()}},
-            ]},
-            page_size=50,
-        )
-        for page in dl_resp["results"]:
-            props = page["properties"]
-            date_raw = (props.get("Date", {}).get("date") or {}).get("start", "")
-            if not date_raw:
-                continue
-            try:
-                page_date = date.fromisoformat(date_raw)
-            except ValueError:
-                continue
-            if page_date in by_date:
-                by_date[page_date]["water_ml"] = float(props.get("Water (ml)", {}).get("number") or 0)
-    except Exception:
-        pass
+    for page in daily_log_rows:
+        props = page["properties"]
+        date_raw = (props.get("Date", {}).get("date") or {}).get("start", "")
+        if not date_raw:
+            continue
+        try:
+            page_date = date.fromisoformat(date_raw)
+        except ValueError:
+            continue
+        if page_date in by_date:
+            by_date[page_date]["water_ml"] = float(props.get("Water (ml)", {}).get("number") or 0)
 
     result = []
     current = start
@@ -1331,18 +1361,10 @@ _GOALS_PAGE_NAME = "⚙️ Goals"
 
 async def get_user_goals() -> dict:
     try:
-        try:
-            schema = await _get_daily_db_props()
-            title_prop = _find_title_prop(schema, db_label="Daily Log database")
-        except Exception:
-            title_prop = "Name"
-        response = await notion.databases.query(
-            database_id=config.NOTION_DAILY_DB_ID,
-            filter={"property": title_prop, "title": {"equals": _GOALS_PAGE_NAME}},
-        )
-        if not response["results"]:
+        page = await _find_daily_log_page(_GOALS_PAGE_NAME)
+        if not page:
             return {}
-        props = response["results"][0]["properties"]
+        props = page["properties"]
         goals = {}
         for notion_key, goal_key in _GOAL_PROPS.items():
             val = props.get(notion_key, {}).get("number")
@@ -1355,22 +1377,15 @@ async def get_user_goals() -> dict:
 
 
 async def save_user_goals(goals: dict) -> None:
-    try:
-        schema = await _get_daily_db_props()
-        title_prop = _find_title_prop(schema, db_label="Daily Log database")
-    except Exception:
-        title_prop = "Name"
+    title_prop = await _daily_log_title_prop()
     properties: dict = {title_prop: {"title": [{"text": {"content": _GOALS_PAGE_NAME}}]}}
     for notion_key, goal_key in _GOAL_PROPS.items():
         if goal_key in goals:
             properties[notion_key] = {"number": int(goals[goal_key])}
     try:
-        response = await notion.databases.query(
-            database_id=config.NOTION_DAILY_DB_ID,
-            filter={"property": title_prop, "title": {"equals": _GOALS_PAGE_NAME}},
-        )
-        if response["results"]:
-            await notion.pages.update(page_id=response["results"][0]["id"], properties=properties)
+        existing = await _find_daily_log_page(_GOALS_PAGE_NAME)
+        if existing:
+            await notion.pages.update(page_id=existing["id"], properties=properties)
         else:
             await notion.pages.create(parent={"database_id": config.NOTION_DAILY_DB_ID}, properties=properties)
         logger.info("User goals saved to Notion: %s", goals)
@@ -1385,37 +1400,28 @@ async def get_food_entries_range(start: date, end: date) -> list[dict]:
         {"property": "Date", "date": {"on_or_after":  start.isoformat()}},
         {"property": "Date", "date": {"on_or_before": end.isoformat()}},
     ]}
+    pages = await _query_all_database_pages(
+        config.NOTION_FOOD_DB_ID,
+        filter=query_filter,
+        sorts=[{"property": "Date", "direction": "ascending"}],
+        page_size=100,
+    )
     rows = []
-    cursor = None
-    while True:
-        kwargs: dict = {
-            "database_id": config.NOTION_FOOD_DB_ID,
-            "filter": query_filter,
-            "sorts": [{"property": "Date", "direction": "ascending"}],
-            "page_size": 100,
-        }
-        if cursor:
-            kwargs["start_cursor"] = cursor
-        response = await notion.databases.query(**kwargs)
-        for page in response["results"]:
-            props = page["properties"]
-            date_val = (props.get("Date", {}).get("date") or {}).get("start", "")
-            rows.append({
-                "date":       date_val,
-                "meal_type":  (props.get("Meal Type",  {}).get("select") or {}).get("name", ""),
-                "log_method": (props.get("Log Method", {}).get("select") or {}).get("name", ""),
-                "name":       _page_title(props),
-                "calories":   _page_number(props, ["Calories"]),
-                "protein_g":  _page_number(props, ["Protein", "Protein (g)"]),
-                "carbs_g":    _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"]),
-                "fat_g":      _page_number(props, ["Fat", "Fat (g)"]),
-                "fiber_g":    _page_number(props, ["Fiber", "Fiber (g)"]),
-                "sugar_g":    _page_number(props, ["Sugar", "Sugar (g)"]),
-                "sodium_mg":  _page_number(props, ["Sodium", "Sodium (mg)"]),
-                "portion_size": _page_rich_text(props, ["Portion Size", "Portion"]),
-                "notes": _page_rich_text(props, ["Notes"]),
-            })
-        if not response.get("has_more"):
-            break
-        cursor = response.get("next_cursor")
+    for page in pages:
+        props = page["properties"]
+        rows.append({
+            "date":       (props.get("Date", {}).get("date") or {}).get("start", ""),
+            "meal_type":  (props.get("Meal Type",  {}).get("select") or {}).get("name", ""),
+            "log_method": (props.get("Log Method", {}).get("select") or {}).get("name", ""),
+            "name":       _page_title(props),
+            "calories":   _page_number(props, ["Calories"]),
+            "protein_g":  _page_number(props, ["Protein", "Protein (g)"]),
+            "carbs_g":    _page_number(props, ["Carbs", "Carbs (g)", "Carbohydrates"]),
+            "fat_g":      _page_number(props, ["Fat", "Fat (g)"]),
+            "fiber_g":    _page_number(props, ["Fiber", "Fiber (g)"]),
+            "sugar_g":    _page_number(props, ["Sugar", "Sugar (g)"]),
+            "sodium_mg":  _page_number(props, ["Sodium", "Sodium (mg)"]),
+            "portion_size": _page_rich_text(props, ["Portion Size", "Portion"]),
+            "notes": _page_rich_text(props, ["Notes"]),
+        })
     return rows
