@@ -154,6 +154,27 @@ def _progress_bar(current: float, goal: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+_TRACKED_TOTALS = (
+    "calories", "protein_g", "carbs_g", "fat_g",
+    "fiber_g", "sugar_g", "sodium_mg", "water_ml", "weight_kg",
+)
+
+
+def _has_logged_data(totals: dict | None) -> bool:
+    """True if anything at all was recorded today — food, water or a weigh-in.
+
+    get_today_totals always returns a fully-populated dict, so testing the dict
+    itself for truthiness never reports an empty day.
+    """
+    return bool(totals) and any(totals.get(key, 0) for key in _TRACKED_TOTALS)
+
+
+def _total_entries(entries: list[dict]) -> dict[str, float]:
+    """Sum macros over already-fetched entries — avoids a second Notion round-trip."""
+    keys = ("calories", "protein_g", "carbs_g", "fat_g")
+    return {key: sum(e.get(key, 0) or 0 for e in entries) for key in keys}
+
+
 def _confidence_label(nutrition: NutritionData) -> str:
     pct = nutrition.confidence_pct
     return f"~{pct}% confident" if pct else nutrition.confidence
@@ -1625,7 +1646,7 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         get_streak(),
         get_week_calorie_bank(cal_goal),
     )
-    if not totals and not fasting:
+    if not _has_logged_data(totals) and not fasting:
         await msg.edit_text(
             "No meals logged today yet.\n\nJust type what you ate or send a photo to log your first meal.",
         )
@@ -1827,11 +1848,34 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ── /weightchart ──────────────────────────────────────────────────────────────
 
+def _new_chart(figsize: tuple[float, float]):
+    """Create a standalone Agg figure and axes with the shared dark styling.
+
+    Deliberately avoids pyplot: charts render in worker threads (two at once
+    for /chart) and pyplot's global figure registry is not thread-safe. It also
+    means figures are garbage-collected instead of needing an explicit close.
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=figsize)
+    FigureCanvasAgg(fig)
+    fig.patch.set_facecolor("#1a1a2e")
+    ax = fig.subplots()
+    ax.set_facecolor("#16213e")
+    return fig, ax
+
+
+def _render_png(fig) -> "io.BytesIO":
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150,
+                bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    return buf
+
+
 def _generate_weight_chart(data: list[dict], goal_weight: float | None = None) -> "io.BytesIO":
-    import io as _io
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     import numpy as np
     from datetime import date as _date
@@ -1839,9 +1883,7 @@ def _generate_weight_chart(data: list[dict], goal_weight: float | None = None) -
     dates   = [_date.fromisoformat(d["date"]) for d in data]
     weights = [d["weight_kg"] for d in data]
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#16213e")
+    fig, ax = _new_chart((10, 5))
 
     ax.plot(dates, weights, color="#4CAF50", linewidth=2.5, marker="o",
             markersize=7, markerfacecolor="#81C784", zorder=3, label="Weight")
@@ -1902,13 +1944,7 @@ def _generate_weight_chart(data: list[dict], goal_weight: float | None = None) -
     ax.legend(loc="upper right", facecolor="#1a1a2e",
               labelcolor="white", edgecolor="#444", fontsize=10)
 
-    fig.tight_layout()
-    buf = _io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150,
-                bbox_inches="tight", facecolor=fig.get_facecolor())
-    buf.seek(0)
-    plt.close(fig)
-    return buf
+    return _render_png(fig)
 
 
 async def weightchart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2104,8 +2140,7 @@ async def menu_food_templates_callback(update: Update, context: ContextTypes.DEF
 async def menu_food_summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    from notion_helper import get_today_totals as _get_today_totals
-    totals = await _get_today_totals(date.today())
+    totals = await get_today_totals(date.today())
     cal      = totals.get("calories", 0) if totals else 0
     protein  = totals.get("protein_g", 0) if totals else 0
     carbs    = totals.get("carbs_g", 0) if totals else 0
@@ -2131,7 +2166,6 @@ async def menu_food_today_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     entries = await get_today_food_entries(date.today())
-    totals  = await get_today_totals(date.today())
     if not entries:
         await query.message.reply_text("Nothing logged today yet. Just describe what you ate to log it!")
         return
@@ -2141,14 +2175,14 @@ async def menu_food_today_callback(update: Update, context: ContextTypes.DEFAULT
         cal_str  = f"  {e['calories']:.0f} kcal" if e["calories"] else ""
         prot_str = f"  {e['protein_g']:.0f}g P" if e.get("protein_g") else ""
         lines.append(f"{tag}{e['name'][:30]}{cal_str}{prot_str}")
-    if totals:
-        lines += [
-            "",
-            f"Total: {totals.get('calories',0):.0f} kcal  |  "
-            f"P {totals.get('protein_g',0):.0f}g  "
-            f"C {totals.get('carbs_g',0):.0f}g  "
-            f"F {totals.get('fat_g',0):.0f}g",
-        ]
+    totals = _total_entries(entries)
+    lines += [
+        "",
+        f"Total: {totals['calories']:.0f} kcal  |  "
+        f"P {totals['protein_g']:.0f}g  "
+        f"C {totals['carbs_g']:.0f}g  "
+        f"F {totals['fat_g']:.0f}g",
+    ]
     await query.message.reply_text("\n".join(lines))
 
 
@@ -3039,7 +3073,6 @@ async def today_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     msg = await update.message.reply_text("Fetching today's meals...")
     entries = await get_today_food_entries(date.today())
-    totals = await get_today_totals(date.today())
     if not entries:
         await msg.edit_text("Nothing logged today yet. Just type what you ate to log it!")
         return
@@ -3049,14 +3082,14 @@ async def today_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         cal_str = f"  {e['calories']:.0f} kcal" if e["calories"] else ""
         prot_str = f"  {e['protein_g']:.0f}g protein" if e.get("protein_g") else ""
         lines.append(f"{tag}{e['name'][:32]}{cal_str}{prot_str}")
-    if totals:
-        lines += [
-            "",
-            f"Total:  {totals.get('calories', 0):.0f} kcal  |  "
-            f"P {totals.get('protein_g', 0):.0f}g  "
-            f"C {totals.get('carbs_g', 0):.0f}g  "
-            f"F {totals.get('fat_g', 0):.0f}g",
-        ]
+    totals = _total_entries(entries)
+    lines += [
+        "",
+        f"Total:  {totals['calories']:.0f} kcal  |  "
+        f"P {totals['protein_g']:.0f}g  "
+        f"C {totals['carbs_g']:.0f}g  "
+        f"F {totals['fat_g']:.0f}g",
+    ]
     await msg.edit_text("\n".join(lines))
 
 
@@ -3122,11 +3155,6 @@ async def delete_entry_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # ── /chart ─────────────────────────────────────────────────────────────────────
 
 def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
-    import io as _io
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     labels   = [d["date"].strftime("%a\n%b %d") for d in data]
     calories = [d["calories"] for d in data]
 
@@ -3141,9 +3169,7 @@ def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
         else:
             colors.append("#f44336")
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#16213e")
+    fig, ax = _new_chart((10, 5))
 
     bars = ax.bar(range(len(labels)), calories, color=colors, width=0.6, zorder=3)
     ax.axhline(y=cal_goal, color="#ffffff", linestyle="--",
@@ -3173,29 +3199,16 @@ def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
     ax.legend(loc="upper right", facecolor="#1a1a2e",
               labelcolor="white", edgecolor="#444", fontsize=10)
 
-    fig.tight_layout()
-    buf = _io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150,
-                bbox_inches="tight", facecolor=fig.get_facecolor())
-    buf.seek(0)
-    plt.close(fig)
-    return buf
+    return _render_png(fig)
 
 
 def _generate_macro_chart(data: list[dict]) -> "io.BytesIO":
-    import io as _io
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     labels   = [d["date"].strftime("%a\n%b %d") for d in data]
     protein  = [d["protein_g"] for d in data]
     carbs    = [d["carbs_g"]   for d in data]
     fat      = [d["fat_g"]     for d in data]
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#16213e")
+    fig, ax = _new_chart((10, 4))
 
     x = range(len(labels))
     ax.plot(x, protein, color="#4CAF50", linewidth=2, marker="o", label="Protein (g)")
@@ -3216,13 +3229,7 @@ def _generate_macro_chart(data: list[dict]) -> "io.BytesIO":
     ax.legend(loc="upper right", facecolor="#1a1a2e", labelcolor="white",
               edgecolor="#444", fontsize=10)
 
-    fig.tight_layout()
-    buf = _io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150,
-                bbox_inches="tight", facecolor=fig.get_facecolor())
-    buf.seek(0)
-    plt.close(fig)
-    return buf
+    return _render_png(fig)
 
 
 async def chart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3457,12 +3464,12 @@ async def _maybe_create_monthly_review(app: Application) -> None:
 
 async def _ensure_weight_property() -> None:
     """Adds Weight (kg), Fasting, and goal number props to Daily Log DB on first run."""
-    from notion_client import AsyncClient
-    import config as _cfg
-    notion = AsyncClient(auth=_cfg.NOTION_API_KEY)
+    # Reuse the shared client — a second AsyncClient would open its own
+    # connection pool that nothing ever closes.
+    from notion_helper import notion
     try:
         await notion.databases.update(
-            database_id=_cfg.NOTION_DAILY_DB_ID,
+            database_id=config.NOTION_DAILY_DB_ID,
             properties={
                 "Weight (kg)":        {"number": {"format": "number"}},
                 "Fasting":            {"checkbox": {}},

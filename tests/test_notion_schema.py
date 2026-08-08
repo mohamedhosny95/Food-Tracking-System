@@ -5,7 +5,7 @@ import sys
 import types
 import unittest
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 
 def _install_import_stubs() -> None:
@@ -66,13 +66,33 @@ class FakeDatabases:
         self.query_results = query_results or []
         self.last_query = None
         self.updated = []
+        self.query_calls = 0
+        # When set, query() honours Date sorts and paginates like Notion does.
+        self.page_size = None
 
     async def retrieve(self, **kwargs):
         return {"properties": self.schema}
 
     async def query(self, **kwargs):
         self.last_query = kwargs
-        return {"results": self.query_results}
+        self.query_calls += 1
+        if self.page_size is None:
+            return {"results": self.query_results}
+
+        rows = list(self.query_results)
+        sorts = kwargs.get("sorts") or []
+        if sorts and sorts[0].get("property") == "Date":
+            rows.sort(
+                key=lambda r: (r["properties"].get("Date", {}).get("date") or {}).get("start", ""),
+                reverse=sorts[0].get("direction") == "descending",
+            )
+        start = int(kwargs.get("start_cursor") or 0)
+        end = start + self.page_size
+        return {
+            "results": rows[start:end],
+            "has_more": end < len(rows),
+            "next_cursor": str(end),
+        }
 
     async def update(self, **kwargs):
         self.updated.append(kwargs)
@@ -305,6 +325,94 @@ class NotionTodayEntryMappingTests(unittest.TestCase):
         self.assertEqual(totals["fat_g"], 11)
         self.assertEqual(totals["fiber_g"], 4)
         self.assertEqual(totals["sodium_mg"], 550)
+
+    def test_today_entries_paginate_beyond_one_page(self):
+        """A day with more than one page of entries must not be truncated."""
+        results = [
+            {
+                "id": f"page-{i}",
+                "properties": {
+                    "Name": {"title": [{"text": {"content": f"Snack {i}"}}]},
+                    "Calories": {"number": 10},
+                },
+            }
+            for i in range(150)
+        ]
+        fake = FakeNotion({"Name": _prop("title")}, results)
+        fake.databases.page_size = 100
+        old_notion = notion_helper.notion
+        notion_helper.notion = fake
+        try:
+            entries = asyncio.run(notion_helper.get_today_food_entries(date(2026, 5, 10)))
+            totals = asyncio.run(notion_helper.get_today_totals(date(2026, 5, 10)))
+        finally:
+            notion_helper.notion = old_notion
+
+        self.assertEqual(len(entries), 150)
+        self.assertEqual(totals["calories"], 1500)
+
+
+class NotionStreakTests(unittest.TestCase):
+    """get_streak walks entries newest-first and stops at the first gap."""
+
+    def setUp(self):
+        notion_helper._FOOD_DB_PROPS = None
+        notion_helper._DAILY_DB_PROPS = None
+        self.today = date.today()
+
+    def _streak_for(self, day_offsets):
+        results = [
+            {
+                "id": f"page-{i}",
+                "properties": {
+                    "Date": {
+                        "date": {
+                            "start": (self.today - timedelta(days=offset)).isoformat()
+                        }
+                    }
+                },
+            }
+            for i, offset in enumerate(day_offsets)
+        ]
+        fake = FakeNotion({"Name": _prop("title")}, results)
+        fake.databases.page_size = 100
+        old_notion = notion_helper.notion
+        notion_helper.notion = fake
+        try:
+            return asyncio.run(notion_helper.get_streak()), fake.databases
+        finally:
+            notion_helper.notion = old_notion
+
+    def test_counts_consecutive_days_ending_today(self):
+        streak, _ = self._streak_for([0, 1, 2])
+        self.assertEqual(streak, 3)
+
+    def test_multiple_entries_on_one_day_count_once(self):
+        streak, _ = self._streak_for([0, 0, 0, 1, 1])
+        self.assertEqual(streak, 2)
+
+    def test_streak_is_zero_when_today_is_unlogged(self):
+        streak, _ = self._streak_for([1, 2, 3])
+        self.assertEqual(streak, 0)
+
+    def test_stops_at_first_gap(self):
+        streak, _ = self._streak_for([0, 1, 4, 5, 6])
+        self.assertEqual(streak, 2)
+
+    def test_query_sorts_newest_first_so_the_scan_can_stop_early(self):
+        _, databases = self._streak_for([0, 1, 2])
+        self.assertEqual(
+            databases.last_query["sorts"],
+            [{"property": "Date", "direction": "descending"}],
+        )
+
+    def test_broken_streak_reads_only_the_first_page(self):
+        # 400 entries across 90 days, but the streak breaks immediately —
+        # the old implementation paged through all of them.
+        offsets = [0, 0, 0] + [i for i in range(2, 90) for _ in range(5)]
+        streak, databases = self._streak_for(offsets)
+        self.assertEqual(streak, 1)
+        self.assertEqual(databases.query_calls, 1)
 
 
 class NotionDailyLogSchemaTests(unittest.IsolatedAsyncioTestCase):
