@@ -3585,7 +3585,15 @@ def main() -> None:
             CallbackQueryHandler(menu_food_templates_callback, pattern="^menu_food_templates$"),
             MessageHandler(filters.PHOTO, photo_entry),
             MessageHandler(filters.VOICE, voice_entry),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler),
+            # No catch-all TEXT entry point here on purpose: this ConversationHandler
+            # has allow_reentry=True, which makes PTB check entry_points *before* the
+            # active state's own handlers on every update, even mid-conversation. A
+            # catch-all text entry point would therefore win over every state below
+            # that expects typed input (goals, water ml, weight kg, macro edits,
+            # portion %, name corrections, template weights/descriptions) and reroute
+            # it to food-description parsing instead. Plain text with no conversation
+            # active still reaches text_handler via the global handler registered
+            # after this ConversationHandler in main().
         ],
         states={
             WAITING_FOR_TEXT: [
