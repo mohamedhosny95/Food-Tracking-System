@@ -154,6 +154,21 @@ def _progress_bar(current: float, goal: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+_TRACKED_TOTALS = (
+    "calories", "protein_g", "carbs_g", "fat_g",
+    "fiber_g", "sugar_g", "sodium_mg", "water_ml", "weight_kg",
+)
+
+
+def _has_logged_data(totals: dict | None) -> bool:
+    """True if anything at all was recorded today — food, water or a weigh-in.
+
+    get_today_totals always returns a fully-populated dict, so testing the dict
+    itself for truthiness never reports an empty day.
+    """
+    return bool(totals) and any(totals.get(key, 0) for key in _TRACKED_TOTALS)
+
+
 def _total_entries(entries: list[dict]) -> dict[str, float]:
     """Sum macros over already-fetched entries — avoids a second Notion round-trip."""
     keys = ("calories", "protein_g", "carbs_g", "fat_g")
@@ -1631,7 +1646,7 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         get_streak(),
         get_week_calorie_bank(cal_goal),
     )
-    if not totals and not fasting:
+    if not _has_logged_data(totals) and not fasting:
         await msg.edit_text(
             "No meals logged today yet.\n\nJust type what you ate or send a photo to log your first meal.",
         )
