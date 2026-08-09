@@ -1,5 +1,5 @@
-python-telegram-bot[job-queue,webhooks]==20.7
-google-generativeai>=0.8.0
+python-telegram-bot[job-queue,webhooks]==22.8
+google-genai==2.13.0
 Pillow==10.4.0
 notion-client==2.2.1
 python-dotenv==1.0.1

@@ -26,6 +26,7 @@ import sys
 import types
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 try:
@@ -36,7 +37,7 @@ except ImportError:
 
 
 # Modules this test forcibly replaces in sys.modules so it can import the real
-# bot.py without google-generativeai/notion-client installed. Isolated with an
+# bot.py without google-genai/notion-client installed. Isolated with an
 # explicit save/pop in setUpClass and restore in tearDownClass rather than
 # sys.modules.setdefault(...), because unittest discover imports every test
 # module up front before running any test: test_notion_schema.py installs its
@@ -46,7 +47,7 @@ except ImportError:
 # analyze_food_photo/analyze_food_text/etc. names it imports by name.
 _ISOLATED_MODULES = (
     "vision", "notion_helper", "bot", "config",
-    "google", "google.generativeai", "notion_client",
+    "google", "google.genai", "notion_client",
 )
 
 
@@ -88,18 +89,17 @@ def _build_stub_modules() -> dict:
         databases=types.SimpleNamespace(), pages=types.SimpleNamespace()
     )
 
-    genai = types.ModuleType("google.generativeai")
-    genai.configure = lambda **kw: None
-    genai.GenerativeModel = lambda *a, **kw: types.SimpleNamespace()
-    genai.types = types.SimpleNamespace(GenerationConfig=lambda **kw: None)
+    genai = types.ModuleType("google.genai")
+    genai.Client = lambda *a, **kw: types.SimpleNamespace()
+    genai.types = types.SimpleNamespace(GenerateContentConfig=lambda **kw: None)
     google_pkg = types.ModuleType("google")
-    google_pkg.generativeai = genai
+    google_pkg.genai = genai
 
     return {
         "vision": vision,
         "notion_client": notion_client,
         "google": google_pkg,
-        "google.generativeai": genai,
+        "google.genai": genai,
     }
 
 
@@ -117,7 +117,7 @@ def _extract_real_conv_handler(bot_module):
     """Pull the literal `conv_handler = ConversationHandler(...)` call out of
     main()'s AST and evaluate it against bot's real namespace, so this is the
     exact object main() builds — not a hand-copied stand-in."""
-    src = ast.parse(open("bot.py").read())
+    src = ast.parse(Path("bot.py").read_text(encoding="utf-8"))
     main_fn = next(n for n in src.body if isinstance(n, ast.FunctionDef) and n.name == "main")
     conv_assign = next(
         n for n in ast.walk(main_fn)
@@ -210,7 +210,8 @@ class MidConversationTextRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.bot.SETTING_GOALS, {"editing_goal": "calories"}, "2150",
         )
         self.assertIn("goal updated", text.lower())
-        self.assertEqual(self.app.bot_data.get("goals", {}).get("calories"), 2150)
+        profiles = self.app.bot_data.get("goals", {}).get("profiles", {})
+        self.assertTrue(any(values.get("calories") == 2150 for values in profiles.values()))
 
     async def test_water_amount_receives_typed_ml_not_food_parser(self):
         """Same root cause, different state: typing a water amount must log

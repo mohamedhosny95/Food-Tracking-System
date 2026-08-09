@@ -6,6 +6,7 @@ import types
 import unittest
 from dataclasses import dataclass
 from datetime import date, timedelta
+from unittest.mock import AsyncMock
 
 
 def _install_import_stubs() -> None:
@@ -117,6 +118,20 @@ class FakePages:
         return {"url": "https://notion.test/page", "id": kwargs.get("page_id", "page-id")}
 
 
+class StatefulWaterPages:
+    def __init__(self):
+        self.total = 0
+
+    async def retrieve(self, **kwargs):
+        await asyncio.sleep(0)
+        return {"properties": {"Water (ml)": {"number": self.total}}}
+
+    async def update(self, **kwargs):
+        await asyncio.sleep(0)
+        self.total = kwargs["properties"]["Water (ml)"]["number"]
+        return {"id": kwargs["page_id"]}
+
+
 class FakeNotion:
     def __init__(
         self,
@@ -132,6 +147,24 @@ class NotionFoodEntrySchemaTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         notion_helper._FOOD_DB_PROPS = None
         notion_helper._DAILY_DB_PROPS = None
+
+    async def test_concurrent_water_logs_do_not_lose_an_increment(self):
+        old_notion = notion_helper.notion
+        old_get_daily_log = notion_helper.get_or_create_daily_log
+        pages = StatefulWaterPages()
+        notion_helper.notion = types.SimpleNamespace(pages=pages)
+        notion_helper.get_or_create_daily_log = AsyncMock(return_value="daily-page-id")
+        try:
+            totals = await asyncio.gather(
+                notion_helper.log_water(250, date(2026, 5, 10)),
+                notion_helper.log_water(250, date(2026, 5, 10)),
+            )
+        finally:
+            notion_helper.notion = old_notion
+            notion_helper.get_or_create_daily_log = old_get_daily_log
+
+        self.assertEqual(totals, [250, 500])
+        self.assertEqual(pages.total, 500)
 
     async def test_create_food_entry_uses_legacy_protein_property(self):
         fake = FakeNotion({

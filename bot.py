@@ -6,22 +6,26 @@ import logging.handlers
 import os
 import re
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from telegram.error import Conflict
 from telegram.ext import (
+    ApplicationHandlerStop,
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
     PicklePersistence,
+    TypeHandler,
     filters,
     ContextTypes,
 )
 
 import config
+from nutrition_profiles import PROFILES, NutritionProfile, profile_for_date, weekly_plan_metrics
+from time_utils import APP_TIMEZONE, local_now, local_today
 from vision import (
     analyze_food_photo,
     analyze_food_text,
@@ -83,8 +87,20 @@ def setup_logging() -> None:
 
 def is_authorized(user_id: int) -> bool:
     if not config.ALLOWED_USER_IDS:
-        return True
+        return config.ALLOW_UNAUTHENTICATED
     return user_id in config.ALLOWED_USER_IDS
+
+
+async def authorization_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reject unauthorized users before any command, callback, or conversation runs."""
+    user = update.effective_user
+    if user and is_authorized(user.id):
+        return
+    if update.callback_query:
+        await update.callback_query.answer("Unauthorized.", show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text("Unauthorized.")
+    raise ApplicationHandlerStop
 
 
 # ── Conversation states ────────────────────────────────────────────────────────
@@ -123,17 +139,36 @@ GOAL_META: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _get_goal(bot_data: dict, key: str) -> int:
-    """Return the user-set goal if saved, otherwise fall back to config default."""
-    cfg_attr = GOAL_META[key][2]
-    default = getattr(config, cfg_attr, 0)
-    return int(bot_data.get("goals", {}).get(key, default))
+def _profile_override(bot_data: dict, on_date: date) -> str:
+    return bot_data.get("profile_overrides", {}).get(on_date.isoformat(), "")
+
+
+def _get_profile(bot_data: dict, on_date: date | None = None) -> NutritionProfile:
+    day = on_date or local_today()
+    fasting = day.isoformat() in bot_data.get("fasting_days", set())
+    return profile_for_date(day, fasting=fasting, override=_profile_override(bot_data, day))
+
+
+def _get_goal(bot_data: dict, key: str, on_date: date | None = None) -> int:
+    """Return a profile-specific override or the supplied-plan target."""
+    profile = _get_profile(bot_data, on_date)
+    overrides = bot_data.get("goals", {}).get("profiles", {}).get(profile.key, {})
+    return int(overrides.get(key, profile.goals()[key]))
+
+
+def _week_goal_map(bot_data: dict, start: date, end: date) -> dict[str, int]:
+    goals: dict[str, int] = {}
+    current = start
+    while current <= end:
+        goals[current.isoformat()] = _get_goal(bot_data, "calories", current)
+        current += timedelta(days=1)
+    return goals
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def get_meal_type() -> str:
-    h = datetime.now().hour
+    h = local_now().hour
     if config.MEAL_BREAKFAST_START <= h < config.MEAL_LUNCH_START:   return "Breakfast"
     if config.MEAL_LUNCH_START    <= h < config.MEAL_SNACK_START:    return "Lunch"
     if config.MEAL_SNACK_START    <= h < config.MEAL_DINNER_START:   return "Snack"
@@ -197,18 +232,20 @@ def _build_summary(nutrition: NutritionData, page_url: str = "", meal_type: str 
     ]
     if nutrition.notes:
         lines += ["", f"Notes: {nutrition.notes}"]
+    if getattr(nutrition, "source", ""):
+        lines += [f"Source: {nutrition.source}"]
     if page_url:
         lines += ["", f"Notion: {page_url}"]
     return "\n".join(lines)
 
 
 def _is_fasting(bot_data: dict) -> bool:
-    return date.today().isoformat() in bot_data.get("fasting_days", set())
+    return local_today().isoformat() in bot_data.get("fasting_days", set())
 
 
 async def _load_fasting_from_notion(bot_data: dict) -> bool:
     """Sync fasting status from Notion into bot_data cache on startup/check."""
-    today = date.today()
+    today = local_today()
     is_fasting = await get_fasting_status(today)
     fasting_days: set = bot_data.setdefault("fasting_days", set())
     today_str = today.isoformat()
@@ -227,6 +264,7 @@ def _build_daily_summary(
     week_bank: dict | None = None,
 ) -> str:
     bd = bot_data or {}
+    profile = _get_profile(bd)
 
     def row(label: str, val: float, goal: int, unit: str) -> str:
         bar = _progress_bar(val, goal)
@@ -254,32 +292,33 @@ def _build_daily_summary(
             fasting_tag = "  🌙 Fasting Day"
     header = f"Today's Progress{streak_tag}{fasting_tag}"
 
-    # Incomplete day warning: after 8pm local, if <threshold% of calorie goal and not fasting
-    local_hour = (datetime.now(timezone.utc) + timedelta(hours=config.TIMEZONE_HOURS)).hour
+    # Incomplete-day warnings use the selected profile, including fasting days.
+    local_hour = local_now().hour
     warning = ""
-    if not fasting and local_hour >= 20 and cal < cal_goal * config.LOW_CALORIE_THRESHOLD:
+    warning_hour = 22 if fasting else 20
+    if local_hour >= warning_hour and cal < cal_goal * config.LOW_CALORIE_THRESHOLD:
         shortfall = int(cal_goal - cal)
         warning = f"\n\nYou're {shortfall} kcal below your goal — did you forget to log something?"
 
-    lines = [header]
-    if not fasting:
-        lines += [
-            "",
-            row("Calories", cal,                          cal_goal,                     " kcal"),
-            row("Protein ", totals.get("protein_g", 0),   _get_goal(bd, "protein_g"),   "g"),
-            row("Carbs   ", totals.get("carbs_g", 0),     _get_goal(bd, "carbs_g"),     "g"),
-            row("Fat     ", totals.get("fat_g", 0),       _get_goal(bd, "fat_g"),       "g"),
-            row("Fiber   ", totals.get("fiber_g", 0),     _get_goal(bd, "fiber_g"),     "g"),
-            "",
-            f"Sugar:  {totals.get('sugar_g', 0):.0f}g    Sodium: {totals.get('sodium_mg', 0):.0f}mg",
-        ]
+    calorie_label = "Calories (ceiling)" if profile.calorie_is_ceiling else "Calories"
+    protein_label = "Protein (floor)" if profile.protein_is_floor else "Protein"
+    lines = [f"{header}  ·  {profile.label}", "", row(calorie_label, cal, cal_goal, " kcal")]
+    lines.append(row(protein_label, totals.get("protein_g", 0), _get_goal(bd, "protein_g"), "g"))
+    if _get_goal(bd, "carbs_g") > 0:
+        lines.append(row("Carbs", totals.get("carbs_g", 0), _get_goal(bd, "carbs_g"), "g"))
+    lines += [
+        row("Fat", totals.get("fat_g", 0), _get_goal(bd, "fat_g"), "g"),
+        row("Fiber", totals.get("fiber_g", 0), _get_goal(bd, "fiber_g"), "g"),
+        "",
+        f"Sugar:  {totals.get('sugar_g', 0):.0f}g    Sodium: {totals.get('sodium_mg', 0):.0f}mg",
+    ]
     lines += ["", row("Water", totals.get("water_ml", 0), _get_goal(bd, "water_ml"),   " ml")]
 
     if totals.get("weight_kg"):
         lines += [f"\nWeight: {totals['weight_kg']:.1f} kg"]
 
     # Weekly calorie bank
-    if week_bank and not fasting:
+    if week_bank:
         bank = week_bank.get("bank", 0)
         sign = "+" if bank >= 0 else ""
         days = week_bank.get("days_elapsed", 1)
@@ -304,7 +343,7 @@ async def _log_and_show(
 ) -> None:
     """Save to Notion and edit msg with summary + optional save button."""
     await msg.edit_text("Logging to Notion...")
-    today = date.today()
+    today = local_today()
     daily_log_id = await get_or_create_daily_log(today)
     page_url, page_id = await create_food_entry(
         nutrition, photo_url, daily_log_id, today,
@@ -342,7 +381,7 @@ async def _log_and_show(
 async def _send_macro_remaining(msg, nutrition: NutritionData, context) -> None:
     """Sends a brief remaining-macro nudge ~after the confirmation message."""
     try:
-        totals = await get_today_totals(date.today())
+        totals = await get_today_totals(local_today())
         if not totals:
             return
         bd = context.bot_data
@@ -481,6 +520,8 @@ _HELP_TEXT = (
     "/yesterday   — copy yesterday's meals\n"
     "/delete      — delete a recent entry\n"
     "/goals       — view / update macro goals\n"
+    "/day         — view or override today's nutrition profile\n"
+    "/plan        — profile schedule and weekly calorie math\n"
     "/fasting     — toggle fasting mode\n"
     "/export      — export CSV\n\n"
     "Tip: just type what you ate and I'll log it directly."
@@ -566,8 +607,8 @@ async def quick_water_preset_callback(update: Update, context: ContextTypes.DEFA
         return WAITING_FOR_WATER
 
     amount = int(query.data.split("_")[-1])
-    new_total = await log_water(amount, date.today())
-    water_goal = config.DAILY_WATER_GOAL_ML
+    new_total = await log_water(amount, local_today())
+    water_goal = _get_goal(context.bot_data, "water_ml")
     bar = _progress_bar(new_total, water_goal)
     pct = min(int(new_total / water_goal * 100), 100)
     rem = max(water_goal - new_total, 0)
@@ -654,12 +695,6 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     try:
         photo = update.message.photo[-1]
         tg_file = await context.bot.get_file(photo.file_id)
-        photo_url: str = tg_file.file_path
-        if not photo_url.startswith("http"):
-            photo_url = (
-                f"https://api.telegram.org/file/bot{config.TELEGRAM_BOT_TOKEN}"
-                f"/{tg_file.file_path}"
-            )
         image_bytes = bytes(await tg_file.download_as_bytearray())
 
         await status.edit_text("Identifying food and calculating nutrition...")
@@ -676,7 +711,8 @@ async def photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         # Store pending data
         meal_type = _get_meal_type(context)
         context.user_data["pending_nutrition"] = nutrition
-        context.user_data["pending_photo_url"] = photo_url
+        # Telegram download URLs contain the bot token and expire. Never persist them.
+        context.user_data["pending_photo_url"] = ""
         context.user_data["pending_meal_type"] = meal_type
         context.user_data["pending_log_method"] = "Photo"
 
@@ -874,6 +910,9 @@ async def macro_edit_handler(
             "Couldn't parse those numbers. Send 4 values: calories protein carbs fat\nExample: 450 35 40 12"
         )
         return EDITING_MACROS
+    if not (0 <= cal <= 10_000 and 0 <= prot <= 1_000 and 0 <= carbs <= 2_000 and 0 <= fat <= 1_000):
+        await update.message.reply_text("Those values are outside safe limits. Check them and try again.")
+        return EDITING_MACROS
 
     nutrition.calories  = round(cal, 1)
     nutrition.protein_g = round(prot, 1)
@@ -977,7 +1016,8 @@ def _confirmation_keyboard(meal_type: str = "") -> InlineKeyboardMarkup:
 def _confirmation_preview(nutrition: "NutritionData", label: str = "", meal_type: str = "") -> str:
     conf = _confidence_label(nutrition)
     header = f"I think this is {nutrition.food_name} ({conf})" if not label else label
-    source_line = f"\nSource: {nutrition.source}" if nutrition.source else ""
+    source = getattr(nutrition, "source", "")
+    source_line = f"\nSource: {source}" if source else ""
     meal_line = f"\nMeal: {meal_type}" if meal_type else ""
     return (
         f"{header}{source_line}{meal_line}\n\n"
@@ -1513,13 +1553,14 @@ async def water_amount_handler(
         await update.message.reply_text("Please enter an amount between 1 and 5000 ml.")
         return WAITING_FOR_WATER
 
-    new_total = await log_water(amount, date.today())
-    bar = _progress_bar(new_total, config.DAILY_WATER_GOAL_ML)
-    pct = min(int(new_total / config.DAILY_WATER_GOAL_ML * 100), 100)
-    rem = max(config.DAILY_WATER_GOAL_ML - new_total, 0)
+    new_total = await log_water(amount, local_today())
+    water_goal = _get_goal(context.bot_data, "water_ml")
+    bar = _progress_bar(new_total, water_goal)
+    pct = min(int(new_total / water_goal * 100), 100)
+    rem = max(water_goal - new_total, 0)
     await update.message.reply_text(
         f"💧 +{amount}ml logged\n\n"
-        f"{bar} {new_total}ml / {config.DAILY_WATER_GOAL_ML}ml ({pct}%)\n"
+        f"{bar} {new_total}ml / {water_goal}ml ({pct}%)\n"
         f"{rem}ml remaining today"
     )
     return ConversationHandler.END
@@ -1539,14 +1580,14 @@ async def weight_input_handler(
         await update.message.reply_text("Please enter a weight between 30 and 300 kg.")
         return WAITING_FOR_WEIGHT_INPUT
 
-    await log_weight(weight, date.today())
+    await log_weight(weight, local_today())
 
     # Fetch history to show trend
     history = await get_recent_weights(5)
     lines = [f"⚖️ Weight logged: {weight:.1f} kg"]
 
     # Show change vs previous entry (skip if the first entry is today's — just logged)
-    prev_entries = [e for e in history if e["date"] != date.today().isoformat()]
+    prev_entries = [e for e in history if e["date"] != local_today().isoformat()]
     if prev_entries:
         prev = prev_entries[0]
         delta = weight - prev["weight_kg"]
@@ -1554,13 +1595,13 @@ async def weight_input_handler(
         lines.append(f"Change since {prev['date']}: {sign}{delta:.1f} kg")
 
     # Show last 4 weigh-ins as a mini chart
-    chart_entries = [e for e in history if e["date"] != date.today().isoformat()][:3]
+    chart_entries = [e for e in history if e["date"] != local_today().isoformat()][:3]
     if chart_entries:
         lines.append("")
         lines.append("Recent trend:")
         for e in reversed(chart_entries):
             lines.append(f"  {e['date']}  {e['weight_kg']:.1f} kg")
-        lines.append(f"  {date.today().isoformat()}  {weight:.1f} kg  ← today")
+        lines.append(f"  {local_today().isoformat()}  {weight:.1f} kg  ← today")
 
     # Macro suggestions
     suggested_cal = round(weight * config.KCAL_PER_KG)
@@ -1640,11 +1681,12 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     msg = await update.message.reply_text("Fetching today's totals...")
     fasting = _is_fasting(context.bot_data)
-    cal_goal = _get_goal(context.bot_data, "calories")
+    today = local_today()
+    week_start = today - timedelta(days=today.weekday())
     totals, streak, week_bank = await asyncio.gather(
-        get_today_totals(date.today()),
+        get_today_totals(today),
         get_streak(),
-        get_week_calorie_bank(cal_goal),
+        get_week_calorie_bank(_week_goal_map(context.bot_data, week_start, today)),
     )
     if not _has_logged_data(totals) and not fasting:
         await msg.edit_text(
@@ -1687,13 +1729,14 @@ async def water_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Please enter an amount between 1 and 5000 ml.")
         return
 
-    new_total = await log_water(amount, date.today())
-    bar = _progress_bar(new_total, config.DAILY_WATER_GOAL_ML)
-    pct = min(int(new_total / config.DAILY_WATER_GOAL_ML * 100), 100)
-    rem = max(config.DAILY_WATER_GOAL_ML - new_total, 0)
+    new_total = await log_water(amount, local_today())
+    water_goal = _get_goal(context.bot_data, "water_ml")
+    bar = _progress_bar(new_total, water_goal)
+    pct = min(int(new_total / water_goal * 100), 100)
+    rem = max(water_goal - new_total, 0)
     await update.message.reply_text(
         f"Logged {amount} ml of water.\n\n"
-        f"Water\n{bar} {new_total}/{config.DAILY_WATER_GOAL_ML} ml ({pct}%) — {rem} ml left"
+        f"Water\n{bar} {new_total}/{water_goal} ml ({pct}%) — {rem} ml left"
     )
 
 
@@ -1755,7 +1798,7 @@ async def relog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             notes=meal.get("notes", "Re-logged from saved meals."),
             recognizable=True,
         )
-        today = date.today()
+        today = local_today()
         daily_log_id = await get_or_create_daily_log(today)
         page_url, _ = await create_food_entry(
             nutrition, "", daily_log_id, today,
@@ -1800,7 +1843,7 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Please enter a weight between 30 and 300 kg.")
         return
 
-    await log_weight(weight, date.today())
+    await log_weight(weight, local_today())
 
     # Suggest updated macro targets based on weight
     suggested_cal = round(weight * 33)
@@ -1834,7 +1877,7 @@ async def weight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             weekly_rate = rate * 7
             if (rate < 0 and target < weight) or (rate > 0 and target > weight):
                 days_to_goal = max(int(kg_to_go / rate), 0)
-                arrival = date.today() + timedelta(days=days_to_goal)
+                arrival = local_today() + timedelta(days=days_to_goal)
                 kcal_per_day = abs(weekly_rate) * 7700 / 7
                 lines += [
                     f"Estimated: {arrival.strftime('%b %d, %Y')}  (~{days_to_goal // 7} weeks)",
@@ -2037,7 +2080,7 @@ async def goalweight_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             weekly_rate = rate * 7
             if (rate < 0 and target < current) or (rate > 0 and target > current):
                 days_to_goal = max(int(kg_to_go / rate), 0)
-                arrival = date.today() + timedelta(days=days_to_goal)
+                arrival = local_today() + timedelta(days=days_to_goal)
                 kcal_per_day = abs(weekly_rate) * 7700 / 7
                 lines += [
                     f"At current pace: {arrival.strftime('%b %d, %Y')}  (~{days_to_goal // 7} weeks)",
@@ -2140,7 +2183,7 @@ async def menu_food_templates_callback(update: Update, context: ContextTypes.DEF
 async def menu_food_summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    totals = await get_today_totals(date.today())
+    totals = await get_today_totals(local_today())
     cal      = totals.get("calories", 0) if totals else 0
     protein  = totals.get("protein_g", 0) if totals else 0
     carbs    = totals.get("carbs_g", 0) if totals else 0
@@ -2153,7 +2196,7 @@ async def menu_food_summary_callback(update: Update, context: ContextTypes.DEFAU
     prot_bar = _progress_bar(protein, protein_goal)
     water_bar = _progress_bar(water, water_goal)
     lines = [
-        f"📊 Today — {date.today().strftime('%a %b %d')}\n",
+        f"📊 Today — {local_today().strftime('%a %b %d')}\n",
         f"🔥 Calories  {cal_bar} {cal:.0f}/{cal_goal}",
         f"💪 Protein   {prot_bar} {protein:.0f}/{protein_goal}g",
         f"🍞 Carbs     {carbs:.0f}g   🥑 Fat {fat:.0f}g",
@@ -2165,11 +2208,11 @@ async def menu_food_summary_callback(update: Update, context: ContextTypes.DEFAU
 async def menu_food_today_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    entries = await get_today_food_entries(date.today())
+    entries = await get_today_food_entries(local_today())
     if not entries:
         await query.message.reply_text("Nothing logged today yet. Just describe what you ate to log it!")
         return
-    lines = [f"Today — {date.today().strftime('%a %b %d')}\n"]
+    lines = [f"Today — {local_today().strftime('%a %b %d')}\n"]
     for e in entries:
         tag = f"[{e['meal_type']}] " if e["meal_type"] else ""
         cal_str  = f"  {e['calories']:.0f} kcal" if e["calories"] else ""
@@ -2190,16 +2233,16 @@ async def menu_food_chart_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     msg = await query.message.reply_text("Building charts...")
-    today = date.today()
+    today = local_today()
     data = await get_daily_totals_range(today - timedelta(days=6), today)
-    cal_goal = _get_goal(context.bot_data, "calories")
+    cal_goals = [_get_goal(context.bot_data, "calories", d["date"]) for d in data]
     cal_buf, macro_buf = await asyncio.gather(
-        asyncio.to_thread(_generate_calorie_chart, data, cal_goal),
+        asyncio.to_thread(_generate_calorie_chart, data, cal_goals),
         asyncio.to_thread(_generate_macro_chart, data),
     )
     logged = [d for d in data if d["calories"] > 0]
     avg = sum(d["calories"] for d in logged) / len(logged) if logged else 0
-    on_goal = sum(1 for d in data if d["calories"] >= cal_goal * 0.9)
+    on_goal = sum(1 for d, goal in zip(data, cal_goals) if d["calories"] >= goal * 0.9)
     await msg.delete()
     await query.message.reply_photo(
         photo=cal_buf,
@@ -2218,34 +2261,36 @@ async def menu_food_week_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     msg = await query.message.reply_text("Fetching week data...")
-    today = date.today()
+    today = local_today()
     week_start = today - timedelta(days=today.weekday())
     data = await get_daily_totals_range(week_start, today)
     logged = [d for d in data if d["calories"] > 0]
     if not logged:
         await msg.edit_text("No meals logged this week yet.")
         return
-    cal_goal = _get_goal(context.bot_data, "calories")
+    goal_by_date = {d["date"]: _get_goal(context.bot_data, "calories", d["date"]) for d in data}
     day_lines = []
     for d in data:
         cal = d["calories"]
         day_name = d["date"].strftime("%a")
         if cal > 0:
-            filled = min(round(cal / cal_goal * 5), 5) if cal_goal else 0
+            day_goal = goal_by_date[d["date"]]
+            filled = min(round(cal / day_goal * 5), 5) if day_goal else 0
             bar = "█" * filled + "░" * (5 - filled)
-            day_lines.append(f"{day_name}  {bar}  {cal:.0f} kcal")
+            day_lines.append(f"{day_name}  {bar}  {cal:.0f}/{day_goal} kcal")
         else:
             day_lines.append(f"{day_name}  ░░░░░  —")
     total_cal  = sum(d["calories"] for d in logged)
     total_prot = sum(d["protein_g"] for d in logged)
     avg_cal    = total_cal / len(logged)
+    avg_goal = sum(goal_by_date.values()) / len(goal_by_date)
     lines = [
         f"📅 This week  ({week_start.strftime('%b %d')} – {today.strftime('%b %d')})",
         "",
         *day_lines,
         "",
         f"Total: {total_cal:.0f} kcal  |  Protein: {total_prot:.0f}g",
-        f"Daily avg: {avg_cal:.0f} kcal  (goal: {cal_goal})",
+        f"Daily avg: {avg_cal:.0f} kcal  (profile avg: {avg_goal:.0f})",
     ]
     await msg.edit_text("\n".join(lines))
 
@@ -2253,11 +2298,58 @@ async def menu_food_week_callback(update: Update, context: ContextTypes.DEFAULT_
 
 # ── /fasting ───────────────────────────────────────────────────────────────────
 
+async def day_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    today = local_today()
+    if not context.args:
+        profile = _get_profile(context.bot_data, today)
+        await update.message.reply_text(
+            f"Today's profile: {profile.label}\n\n"
+            "Override with /day gym, /day active, /day flex, /day fasting, "
+            "/day diet_break, or /day auto."
+        )
+        return
+
+    requested = context.args[0].lower().replace("-", "_")
+    if requested == "auto":
+        context.bot_data.setdefault("profile_overrides", {}).pop(today.isoformat(), None)
+        context.bot_data.setdefault("fasting_days", set()).discard(today.isoformat())
+        await set_fasting_status(today, False)
+    elif requested == "fasting":
+        context.bot_data.setdefault("fasting_days", set()).add(today.isoformat())
+        context.bot_data.setdefault("profile_overrides", {}).pop(today.isoformat(), None)
+        context.bot_data["fasting_started_at"] = datetime.now(timezone.utc).isoformat()
+        await set_fasting_status(today, True)
+    elif requested in PROFILES:
+        context.bot_data.setdefault("fasting_days", set()).discard(today.isoformat())
+        context.bot_data.setdefault("profile_overrides", {})[today.isoformat()] = requested
+        await set_fasting_status(today, False)
+    else:
+        await update.message.reply_text("Unknown profile. Use gym, active, flex, fasting, diet_break, or auto.")
+        return
+    await update.message.reply_text(f"Today's profile is now {_get_profile(context.bot_data, today).label}.")
+
+
+async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    metrics = weekly_plan_metrics()
+    await update.message.reply_text(
+        "Nutrition profile schedule\n\n"
+        "Sun/Tue/Thu: Gym · 2,162 kcal\n"
+        "Mon/Wed: Active · 1,990 kcal\n"
+        "Fri/Sat: Flex · ≤2,480 kcal\n\n"
+        f"Weekly total: {metrics['weekly_calories']:.0f} kcal\n"
+        f"Daily average: {metrics['average_calories']:.0f} kcal\n"
+        f"Deficit vs 2,480 TDEE: {metrics['weekly_deficit']:.0f} kcal/week\n"
+        f"Estimated pace: {metrics['estimated_loss_kg']:.2f} kg/week\n\n"
+        "This is slower than the PDF's stated ~0.4 kg/week. Reconcile the plan with its author "
+        "before changing targets to force that pace."
+    )
+
+
 async def fasting_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
-    today = date.today()
+    today = local_today()
     today_str = today.isoformat()
     fasting_days: set = context.bot_data.setdefault("fasting_days", set())
     if today_str in fasting_days:
@@ -2286,13 +2378,13 @@ async def yesterday_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     msg = await update.message.reply_text("Fetching yesterday's meals...")
     meals = await get_yesterday_meals()
     if not meals:
-        yesterday = (date.today() - timedelta(days=1)).strftime("%b %d")
+        yesterday = (local_today() - timedelta(days=1)).strftime("%b %d")
         await msg.edit_text(f"No meals logged on {yesterday}.")
         return
 
     context.user_data["yesterday_meals"] = meals
     total_cal = sum(m["calories"] for m in meals)
-    yesterday = (date.today() - timedelta(days=1)).strftime("%b %d")
+    yesterday = (local_today() - timedelta(days=1)).strftime("%b %d")
     lines = [f"Yesterday ({yesterday}) — {total_cal:.0f} kcal total\n"]
     for i, m in enumerate(meals):
         tag = f"[{m['meal_type']}] " if m["meal_type"] else ""
@@ -2322,7 +2414,7 @@ async def copy_yesterday_callback(
         await query.edit_message_text("Session expired. Run /yesterday again.")
         return
 
-    today = date.today()
+    today = local_today()
     daily_log_id = await get_or_create_daily_log(today)
     meal_type = _get_meal_type(context)
 
@@ -2371,48 +2463,36 @@ async def copy_yesterday_callback(
 # ── /export ────────────────────────────────────────────────────────────────────
 
 async def testapi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tests each Gemini model and Notion, reports which models work."""
+    """Test the configured Gemini model and Notion connection."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
-    import google.generativeai as genai
+    from google import genai
     import config as _cfg
 
-    msg = await update.message.reply_text("Testing all Gemini models + Notion...")
+    msg = await update.message.reply_text("Testing configured Gemini model + Notion...")
     lines = []
 
-    candidates = [
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-2.5-flash-preview-05-20",
-        "gemini-2.5-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b",
-    ]
-    working_model = None
-    for model_name in candidates:
-        try:
-            m = genai.GenerativeModel(model_name)
-            resp = await m.generate_content_async("Reply with just the number 42.")
-            _ = resp.text
-            lines.append(f"✅ {model_name} — works!")
-            if working_model is None:
-                working_model = model_name
-        except Exception as e:
-            short = str(e)[:120]
-            lines.append(f"❌ {model_name} — {short}")
+    try:
+        client = genai.Client(api_key=_cfg.GEMINI_API_KEY)
+        resp = await client.aio.models.generate_content(
+            model=_cfg.GEMINI_MODEL,
+            contents="Reply with just the number 42.",
+        )
+        _ = resp.text
+        lines.append(f"✅ {_cfg.GEMINI_MODEL} — works!")
+    except Exception as e:
+        short = str(e)[:120]
+        lines.append(f"❌ {_cfg.GEMINI_MODEL} — {short}")
 
     # Notion
     try:
-        await get_today_totals(date.today())
+        await get_today_totals(local_today())
         lines.append("✅ Notion OK")
     except Exception as e:
         lines.append(f"❌ Notion FAILED: {e}")
 
-    if working_model:
-        lines.append(f"\nBest working model: {working_model}")
-    else:
-        lines.append("\n⚠️ No Gemini model works — check your API key or enable billing.")
+    lines.append(f"\nConfigured model: {_cfg.GEMINI_MODEL}")
 
     await msg.edit_text("\n".join(lines))
 
@@ -2436,7 +2516,7 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     await query.edit_message_text("Generating export...")
 
-    today = date.today()
+    today = local_today()
     if query.data == "export_7":
         start = today - timedelta(days=6)
         label = "last_7_days"
@@ -2478,7 +2558,7 @@ async def nudge_morning(context) -> None:
     chat_id = context.bot_data.get("chat_id")
     if not chat_id or _is_fasting(context.bot_data):
         return
-    totals = await get_today_totals(date.today())
+    totals = await get_today_totals(local_today())
     if totals and totals.get("calories", 0) > 50:
         return
     streak = await get_streak()
@@ -2494,7 +2574,7 @@ async def nudge_water_midday(context) -> None:
     chat_id = context.bot_data.get("chat_id")
     if not chat_id or _is_fasting(context.bot_data):
         return
-    totals = await get_today_totals(date.today())
+    totals = await get_today_totals(local_today())
     water = totals.get("water_ml", 0) if totals else 0
     goal  = _get_goal(context.bot_data, "water_ml")
     if water >= goal * 0.5:
@@ -2510,7 +2590,7 @@ async def nudge_water_evening(context) -> None:
     chat_id = context.bot_data.get("chat_id")
     if not chat_id or _is_fasting(context.bot_data):
         return
-    totals = await get_today_totals(date.today())
+    totals = await get_today_totals(local_today())
     water = totals.get("water_ml", 0) if totals else 0
     goal  = _get_goal(context.bot_data, "water_ml")
     if water >= goal * 0.5:
@@ -2529,7 +2609,7 @@ async def nudge_lunch(context) -> None:
         return
     if _is_fasting(context.bot_data):
         return
-    totals = await get_today_totals(date.today())
+    totals = await get_today_totals(local_today())
     if totals and totals.get("calories", 0) > 100:
         return  # already logged something
     await context.bot.send_message(
@@ -2545,7 +2625,7 @@ async def check_incomplete_day(context) -> None:
         return
     if _is_fasting(context.bot_data):
         return
-    totals = await get_today_totals(date.today())
+    totals = await get_today_totals(local_today())
     if not totals:
         return
 
@@ -2581,6 +2661,37 @@ async def check_incomplete_day(context) -> None:
         )
 
 
+async def nudge_fasting_evening(context) -> None:
+    """After iftar, restore hydration and meal reminders for fasting profiles."""
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id or not _is_fasting(context.bot_data):
+        return
+    totals = await get_today_totals(local_today())
+    water = totals.get("water_ml", 0)
+    water_goal = _get_goal(context.bot_data, "water_ml")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🌙 Fasting-day check-in: log iftar and begin spreading hydration through the "
+            f"eating window. Water: {water:.0f}/{water_goal} ml."
+        ),
+    )
+
+
+async def check_fasting_day(context) -> None:
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id or not _is_fasting(context.bot_data):
+        return
+    totals = await get_today_totals(local_today())
+    cal_goal = _get_goal(context.bot_data, "calories")
+    protein_goal = _get_goal(context.bot_data, "protein_g")
+    if totals.get("calories", 0) < cal_goal * config.LOW_CALORIE_THRESHOLD or totals.get("protein_g", 0) < protein_goal * config.LOW_CALORIE_THRESHOLD:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🌙 Fasting-day goals are still low. Check /summary and log any missing iftar, evening, or suhoor food.",
+        )
+
+
 async def monthly_weighin_reminder(context) -> None:
     """Sent on the 1st of each month as a weigh-in prompt."""
     chat_id = context.bot_data.get("chat_id")
@@ -2599,7 +2710,7 @@ async def monthly_weighin_reminder(context) -> None:
 
 async def weight_nudge_sunday(context) -> None:
     """Sent Sunday morning if no weight logged this week yet."""
-    if date.today().weekday() != 6:   # 6 = Sunday
+    if local_today().weekday() != 6:   # 6 = Sunday
         return
     chat_id = context.bot_data.get("chat_id")
     if not chat_id:
@@ -2607,7 +2718,7 @@ async def weight_nudge_sunday(context) -> None:
     # Skip if weight was already logged this week
     recent = await get_recent_weights(1)
     if recent:
-        today = date.today()
+        today = local_today()
         week_start = today - timedelta(days=today.weekday())
         if recent[0]["date"] >= week_start.isoformat():
             return
@@ -2979,7 +3090,7 @@ async def week_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Unauthorized.")
         return
     msg = await update.message.reply_text("Fetching this week's data...")
-    today = date.today()
+    today = local_today()
     week_start = today - timedelta(days=today.weekday())
     data = await get_daily_totals_range(week_start, today)
 
@@ -2988,7 +3099,7 @@ async def week_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.edit_text("No meals logged this week yet. Use /log to add your first.")
         return
 
-    cal_goal = _get_goal(context.bot_data, "calories")
+    goal_by_date = {d["date"]: _get_goal(context.bot_data, "calories", d["date"]) for d in data}
     total_cal   = sum(d["calories"]  for d in logged)
     total_prot  = sum(d["protein_g"] for d in logged)
     total_carbs = sum(d["carbs_g"]   for d in logged)
@@ -3001,13 +3112,15 @@ async def week_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         day_name = d["date"].strftime("%a")
         cal = d["calories"]
         if cal > 0:
-            filled = min(round(cal / cal_goal * 5), 5) if cal_goal else 0
+            day_goal = goal_by_date[d["date"]]
+            filled = min(round(cal / day_goal * 5), 5) if day_goal else 0
             bar = "█" * filled + "░" * (5 - filled)
-            day_lines.append(f"{day_name}  {bar}  {cal:.0f} kcal")
+            day_lines.append(f"{day_name}  {bar}  {cal:.0f}/{day_goal} kcal")
         else:
             day_lines.append(f"{day_name}  ░░░░░  —")
 
     days_elapsed = today.weekday() + 1
+    avg_goal = sum(goal_by_date.values()) / len(goal_by_date)
     lines = [
         f"📅 This week  ({week_start.strftime('%b %d')} – {today.strftime('%b %d')})",
         f"Days logged: {len(logged)}/{days_elapsed}",
@@ -3020,7 +3133,7 @@ async def week_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"  Carbs:    {total_carbs:.0f} g",
         f"  Fat:      {total_fat:.0f} g",
         "",
-        f"Daily avg:  {avg_cal:.0f} kcal  (goal: {cal_goal})",
+        f"Daily avg:  {avg_cal:.0f} kcal  (profile avg: {avg_goal:.0f})",
     ]
     if total_water > 0:
         lines.append(f"Total water: {total_water:.0f} ml")
@@ -3052,7 +3165,7 @@ async def calories_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
-    totals = await get_today_totals(date.today())
+    totals = await get_today_totals(local_today())
     cal = totals.get("calories", 0) if totals else 0
     cal_goal = _get_goal(context.bot_data, "calories")
     bar = _progress_bar(cal, cal_goal)
@@ -3072,11 +3185,11 @@ async def today_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Unauthorized.")
         return
     msg = await update.message.reply_text("Fetching today's meals...")
-    entries = await get_today_food_entries(date.today())
+    entries = await get_today_food_entries(local_today())
     if not entries:
         await msg.edit_text("Nothing logged today yet. Just type what you ate to log it!")
         return
-    lines = [f"Today — {date.today().strftime('%a %b %d')}\n"]
+    lines = [f"Today — {local_today().strftime('%a %b %d')}\n"]
     for e in entries:
         tag = f"[{e['meal_type']}] " if e["meal_type"] else ""
         cal_str = f"  {e['calories']:.0f} kcal" if e["calories"] else ""
@@ -3154,17 +3267,18 @@ async def delete_entry_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ── /chart ─────────────────────────────────────────────────────────────────────
 
-def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
+def _generate_calorie_chart(data: list[dict], cal_goal: int | list[int]) -> "io.BytesIO":
     labels   = [d["date"].strftime("%a\n%b %d") for d in data]
     calories = [d["calories"] for d in data]
+    goals = cal_goal if isinstance(cal_goal, list) else [cal_goal] * len(data)
 
     colors = []
-    for cal in calories:
+    for cal, goal in zip(calories, goals):
         if cal == 0:
             colors.append("#444455")
-        elif cal >= cal_goal * 0.9:
+        elif cal >= goal * 0.9:
             colors.append("#4CAF50")
-        elif cal >= cal_goal * 0.6:
+        elif cal >= goal * 0.6:
             colors.append("#FF9800")
         else:
             colors.append("#f44336")
@@ -3172,14 +3286,14 @@ def _generate_calorie_chart(data: list[dict], cal_goal: int) -> "io.BytesIO":
     fig, ax = _new_chart((10, 5))
 
     bars = ax.bar(range(len(labels)), calories, color=colors, width=0.6, zorder=3)
-    ax.axhline(y=cal_goal, color="#ffffff", linestyle="--",
-               linewidth=1.5, alpha=0.6, label=f"Goal: {cal_goal} kcal", zorder=4)
+    ax.plot(range(len(goals)), goals, color="#ffffff", linestyle="--",
+            linewidth=1.5, alpha=0.6, label="Daily profile target", zorder=4)
 
     for bar, cal in zip(bars, calories):
         if cal > 0:
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + cal_goal * 0.01,
+                bar.get_height() + max(goals) * 0.01,
                 f"{int(cal)}", ha="center", va="bottom",
                 color="white", fontsize=9, fontweight="bold",
             )
@@ -3238,18 +3352,18 @@ async def chart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     msg = await update.message.reply_text("Building your charts...")
-    today = date.today()
+    today = local_today()
     data  = await get_daily_totals_range(today - timedelta(days=6), today)
-    cal_goal = _get_goal(context.bot_data, "calories")
+    cal_goals = [_get_goal(context.bot_data, "calories", d["date"]) for d in data]
 
     cal_buf, macro_buf = await asyncio.gather(
-        asyncio.to_thread(_generate_calorie_chart, data, cal_goal),
+        asyncio.to_thread(_generate_calorie_chart, data, cal_goals),
         asyncio.to_thread(_generate_macro_chart, data),
     )
 
     logged  = [d for d in data if d["calories"] > 0]
     avg     = sum(d["calories"] for d in logged) / len(logged) if logged else 0
-    on_goal = sum(1 for d in data if d["calories"] >= cal_goal * 0.9)
+    on_goal = sum(1 for d, goal in zip(data, cal_goals) if d["calories"] >= goal * 0.9)
 
     await msg.delete()
     await update.message.reply_photo(
@@ -3262,7 +3376,8 @@ async def chart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── /goals ─────────────────────────────────────────────────────────────────────
 
 def _goals_text(bot_data: dict) -> str:
-    lines = ["📊 Your Daily Goals\n"]
+    profile = _get_profile(bot_data)
+    lines = [f"📊 {profile.label} Goals\n"]
     for key, (label, unit, _) in GOAL_META.items():
         val = _get_goal(bot_data, key)
         lines.append(f"{label}: {val} {unit}")
@@ -3325,6 +3440,7 @@ async def goals_pick_callback(
     label, unit, _ = GOAL_META[goal_key]
     current = _get_goal(context.bot_data, goal_key)
     context.user_data["editing_goal"] = goal_key
+    context.user_data["editing_profile"] = _get_profile(context.bot_data).key
 
     await query.edit_message_text(
         f"{label}\n"
@@ -3353,10 +3469,14 @@ async def goals_input_handler(
         return SETTING_GOALS
 
     goals: dict = dict(context.bot_data.get("goals", {}))
-    goals[goal_key] = new_val
+    profile_key = context.user_data.get("editing_profile") or _get_profile(context.bot_data).key
+    profiles = {name: dict(values) for name, values in goals.get("profiles", {}).items()}
+    profiles.setdefault(profile_key, {})[goal_key] = new_val
+    goals["profiles"] = profiles
     context.bot_data["goals"] = goals
     await save_user_goals(goals)
     context.user_data.pop("editing_goal", None)
+    context.user_data.pop("editing_profile", None)
 
     await update.message.reply_text(
         f"✅ {label} goal updated to {new_val} {unit}\n\n"
@@ -3426,8 +3546,7 @@ async def self_ping(context) -> None:
 
 async def _maybe_create_weekly_review(app: Application) -> None:
     """Runs on startup. If it's Saturday in the user's timezone, creates last week's review page in Notion."""
-    _user_tz = timezone(timedelta(hours=config.TIMEZONE_HOURS))
-    if datetime.now(_user_tz).weekday() != 5:  # 5 = Saturday
+    if local_now().weekday() != 5:  # 5 = Saturday
         return
     if not config.NOTION_PARENT_PAGE_ID:
         return
@@ -3445,8 +3564,7 @@ async def _maybe_create_weekly_review(app: Application) -> None:
 
 async def _maybe_create_monthly_review(app: Application) -> None:
     """Runs on startup on the 1st of each month (user's timezone) to create last month's review in Notion."""
-    _user_tz = timezone(timedelta(hours=config.TIMEZONE_HOURS))
-    if datetime.now(_user_tz).day != 1:
+    if local_now().day != 1:
         return
     if not config.NOTION_PARENT_PAGE_ID:
         return
@@ -3480,6 +3598,7 @@ async def _ensure_weight_property() -> None:
                 "Goal Fat":           {"number": {"format": "number"}},
                 "Goal Fiber":         {"number": {"format": "number"}},
                 "Goal Water":         {"number": {"format": "number"}},
+                "Profile Goals":      {"rich_text": {}},
             },
         )
     except Exception:
@@ -3491,6 +3610,10 @@ async def _ensure_weight_property() -> None:
 def main() -> None:
     setup_logging()
     logger = logging.getLogger(__name__)
+    if not config.ALLOW_UNAUTHENTICATED and len(config.ALLOWED_USER_IDS) != 1:
+        raise RuntimeError(
+            "Set exactly one ALLOWED_USER_IDS owner. This deployment uses one shared Notion dataset."
+        )
     logger.info("Starting Food Tracker Bot...")
 
     async def post_init(application: Application) -> None:
@@ -3516,6 +3639,8 @@ def main() -> None:
             BotCommand("weightchart", "Weight trend chart"),
             BotCommand("goalweight",  "Set or view target weight goal"),
             BotCommand("goals",       "View or update macro goals"),
+            BotCommand("day",         "View or override today's profile"),
+            BotCommand("plan",        "View plan schedule and weekly math"),
             BotCommand("fasting",     "Toggle fasting mode for today"),
             BotCommand("export",      "Export your food log as CSV"),
             BotCommand("help",        "Show all commands"),
@@ -3673,6 +3798,7 @@ def main() -> None:
         persistent=True,
     )
 
+    app.add_handler(TypeHandler(Update, authorization_guard), group=-100)
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(menu_food_summary_callback, pattern="^menu_food_summary$"))
     app.add_handler(CallbackQueryHandler(menu_food_today_callback,   pattern="^menu_food_today$"))
@@ -3689,6 +3815,8 @@ def main() -> None:
     app.add_handler(CommandHandler("weight",      weight_handler))
     app.add_handler(CommandHandler("weightchart", weightchart_handler))
     app.add_handler(CommandHandler("goalweight",  goalweight_handler))
+    app.add_handler(CommandHandler("day",         day_handler))
+    app.add_handler(CommandHandler("plan",        plan_handler))
     app.add_handler(CommandHandler("fasting",     fasting_handler))
     app.add_handler(CommandHandler("yesterday",   yesterday_handler))
     app.add_handler(CommandHandler("export",      export_handler))
@@ -3730,22 +3858,20 @@ def main() -> None:
     app.add_error_handler(_error_handler)
 
     # ── Scheduled nudges ──────────────────────────────────────────────────────
-    import datetime as _dt
-    tz_offset = _dt.timezone(timedelta(hours=config.TIMEZONE_HOURS))
-
-    def _local_to_utc(hour: int, minute: int = 0) -> _dt.time:
-        utc_hour = (hour - config.TIMEZONE_HOURS) % 24
-        return _dt.time(utc_hour, minute, tzinfo=_dt.timezone.utc)
+    def _local_time(hour: int, minute: int = 0) -> time:
+        return time(hour, minute, tzinfo=APP_TIMEZONE)
 
     jq = app.job_queue
-    jq.run_daily(nudge_morning,          time=_local_to_utc(9,  0))   # 9:00am local
-    jq.run_daily(nudge_water_midday,     time=_local_to_utc(12, 0))   # 12:00pm local
-    jq.run_daily(nudge_lunch,            time=_local_to_utc(14, 0))   # 2:00pm local
-    jq.run_daily(nudge_water_evening,    time=_local_to_utc(18, 0))   # 6:00pm local
-    jq.run_daily(check_incomplete_day,   time=_local_to_utc(20, 0))   # 8:00pm local
+    jq.run_daily(nudge_morning,          time=_local_time(9,  0))
+    jq.run_daily(nudge_water_midday,     time=_local_time(12, 0))
+    jq.run_daily(nudge_lunch,            time=_local_time(14, 0))
+    jq.run_daily(nudge_water_evening,    time=_local_time(18, 0))
+    jq.run_daily(check_incomplete_day,   time=_local_time(20, 0))
+    jq.run_daily(nudge_fasting_evening,  time=_local_time(20, 30))
+    jq.run_daily(check_fasting_day,      time=_local_time(22, 15))
     jq.run_monthly(monthly_weighin_reminder,                           # 1st of month 9am
-                   when=_local_to_utc(9, 0), day=1)
-    jq.run_daily(weight_nudge_sunday, time=_local_to_utc(8, 0))      # 8am local (fires daily, acts only on Sunday)
+                   when=_local_time(9, 0), day=1)
+    jq.run_daily(weight_nudge_sunday, time=_local_time(8, 0))
 
     # Self-ping every 10 min to keep Render free-tier alive (no-op if not on Render)
     jq.run_repeating(self_ping, interval=600, first=60)
@@ -3754,13 +3880,20 @@ def main() -> None:
     port = int(os.environ.get("PORT", 8080))
 
     if webhook_domain:
-        webhook_url = f"https://{webhook_domain}/{config.TELEGRAM_BOT_TOKEN}"
-        logger.info("Bot starting in webhook mode on port %d — %s", port, webhook_url)
+        webhook_path = os.environ.get("WEBHOOK_PATH", "").strip("/")
+        webhook_secret = os.environ.get("WEBHOOK_SECRET_TOKEN", "")
+        if not webhook_path or not webhook_secret:
+            raise RuntimeError("WEBHOOK_PATH and WEBHOOK_SECRET_TOKEN are required in webhook mode")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", webhook_secret):
+            raise RuntimeError("WEBHOOK_SECRET_TOKEN must be 16-256 letters, digits, '_' or '-'")
+        webhook_url = f"https://{webhook_domain}/{webhook_path}"
+        logger.info("Bot starting in webhook mode on port %d", port)
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
-            url_path=config.TELEGRAM_BOT_TOKEN,
+            url_path=webhook_path,
             webhook_url=webhook_url,
+            secret_token=webhook_secret,
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=False,
         )

@@ -31,6 +31,8 @@ COMMANDS = [
     BotCommand("weight",      "Log your body weight (e.g. /weight 85)"),
     BotCommand("weightchart", "Weight trend chart"),
     BotCommand("goals",       "View or update macro goals"),
+    BotCommand("day",         "View or override today's profile"),
+    BotCommand("plan",        "View plan schedule and weekly math"),
     BotCommand("fasting",     "Toggle fasting mode for today"),
     BotCommand("export",      "Export your food log as CSV"),
 ]

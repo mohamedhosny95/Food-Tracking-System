@@ -9,7 +9,7 @@ TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 # Google Gemini — free tier: 1,500 requests/day, 15 requests/minute
 # Get key at: aistudio.google.com/app/apikey
 GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 # Notion — get key at: notion.so/my-integrations
 NOTION_API_KEY: str = os.environ["NOTION_API_KEY"]
@@ -27,16 +27,19 @@ DAILY_FAT_GOAL: int = int(os.getenv("DAILY_FAT_GOAL", 65))
 DAILY_FIBER_GOAL: int = int(os.getenv("DAILY_FIBER_GOAL", 30))
 DAILY_WATER_GOAL_ML: int = int(os.getenv("DAILY_WATER_GOAL_ML", 2500))
 
-# Timezone offset from UTC (e.g. 3 for UTC+3, used for scheduled nudges)
-TIMEZONE_HOURS: int = int(os.getenv("TIMEZONE_HOURS", "3"))
+# IANA timezone handles calendar boundaries and daylight-saving rules correctly.
+TIMEZONE_NAME: str = os.getenv("TIMEZONE_NAME", "Africa/Cairo")
 
-# Optional: comma-separated Telegram user IDs to whitelist (leave empty = allow all)
+# Telegram owner IDs. This single-dataset deployment validates exactly one in main().
 _raw_ids: str = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS: list[int] = (
     [int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip()]
     if _raw_ids.strip()
     else []
 )
+ALLOW_UNAUTHENTICATED: bool = os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() in {
+    "1", "true", "yes", "on"
+}
 
 # Meal type hour thresholds (24-hour clock, local time)
 MEAL_BREAKFAST_START: int = 5
