@@ -7,7 +7,7 @@ import unittest
 def _load_pure_helpers(*names: str) -> dict:
     """Exec named top-level functions out of bot.py.
 
-    bot.py imports telegram and google-generativeai at module scope, so it
+    bot.py imports telegram and google-genai at module scope, so it
     cannot be imported directly here. These helpers are pure, so lifting them
     out of the AST exercises the real source without the dependencies.
     """

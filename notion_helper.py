@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 from datetime import date, datetime, timedelta
@@ -8,6 +9,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
 from vision import NutritionData
+from time_utils import local_today
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,17 @@ notion = AsyncClient(auth=config.NOTION_API_KEY)
 _FOOD_DB_PROPS: dict | None = None
 _DAILY_DB_PROPS: dict | None = None
 _SAVED_MEALS_DB_PROPS: dict | None = None
+_daily_log_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+_water_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+
+
+def _async_lock_for(
+    locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock],
+    key: str,
+) -> asyncio.Lock:
+    """Return a process-local lock scoped to the current event loop and key."""
+    loop = asyncio.get_running_loop()
+    return locks.setdefault((loop, key), asyncio.Lock())
 
 
 async def _get_food_db_props(refresh: bool = False) -> dict:
@@ -324,6 +337,7 @@ async def ensure_notion_schema() -> None:
             "Goal Fat":      {"number": {"format": "number"}},
             "Goal Fiber":    {"number": {"format": "number"}},
             "Goal Water":    {"number": {"format": "number"}},
+            "Profile Goals": {"rich_text": {}},
         })
         if basic_daily:
             await notion.databases.update(database_id=config.NOTION_DAILY_DB_ID, properties=basic_daily)
@@ -405,6 +419,11 @@ async def _find_daily_log_page(title: str) -> dict | None:
 @_retry
 async def get_or_create_daily_log(today: date) -> str:
     date_str = today.isoformat()
+    async with _async_lock_for(_daily_log_locks, date_str):
+        return await _get_or_create_daily_log_unlocked(date_str)
+
+
+async def _get_or_create_daily_log_unlocked(date_str: str) -> str:
     try:
         schema = await _get_daily_db_props()
         title_prop = _find_title_prop(schema, db_label="Daily Log database")
@@ -498,16 +517,17 @@ async def get_today_totals(today: date) -> dict:
 
 @_retry
 async def log_water(amount_ml: int, today: date) -> int:
-    daily_log_id = await get_or_create_daily_log(today)
-    page = await notion.pages.retrieve(page_id=daily_log_id)
-    current = float(page["properties"].get("Water (ml)", {}).get("number") or 0)
-    new_total = int(current) + amount_ml
-    await notion.pages.update(
-        page_id=daily_log_id,
-        properties={"Water (ml)": {"number": new_total}},
-    )
-    logger.info("Water logged: +%dml → total %dml for %s", amount_ml, new_total, today)
-    return new_total
+    async with _async_lock_for(_water_locks, today.isoformat()):
+        daily_log_id = await get_or_create_daily_log(today)
+        page = await notion.pages.retrieve(page_id=daily_log_id)
+        current = float(page["properties"].get("Water (ml)", {}).get("number") or 0)
+        new_total = int(current) + amount_ml
+        await notion.pages.update(
+            page_id=daily_log_id,
+            properties={"Water (ml)": {"number": new_total}},
+        )
+        logger.info("Water logged: +%dml → total %dml for %s", amount_ml, new_total, today)
+        return new_total
 
 
 async def set_fasting_status(today: date, fasting: bool) -> None:
@@ -545,6 +565,10 @@ async def create_food_entry(
     log_method: str = "",
 ) -> tuple[str, str]:
     date_str = today.isoformat()
+    entry_notes = nutrition.notes
+    source = getattr(nutrition, "source", "")
+    if source:
+        entry_notes = f"{entry_notes}\nSource: {source}".strip()
 
     # Load schema — fall back to empty dict if unreachable; _set_if_present will
     # skip unknown columns, and the hardcoded fallback block handles the rest.
@@ -573,7 +597,7 @@ async def create_food_entry(
         _set_if_present(properties, schema, ["Sodium", "Sodium (mg)"], {"number": _safe_int(nutrition.sodium_mg)}, "number")
         _set_if_present(properties, schema, ["Portion Size", "Portion"], {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]}, "rich_text")
         confidence_prop = _set_select_if_allowed(properties, schema, ["Confidence"], nutrition.confidence)
-        notes_prop = _set_if_present(properties, schema, ["Notes"], {"rich_text": [{"text": {"content": nutrition.notes[:2000]}}]}, "rich_text")
+        notes_prop = _set_if_present(properties, schema, ["Notes"], {"rich_text": [{"text": {"content": entry_notes[:2000]}}]}, "rich_text")
         relation_prop = _set_relation_if_target(properties, schema, ["Daily Log"], daily_log_id, config.NOTION_DAILY_DB_ID)
         meal_prop = _set_select_if_allowed(properties, schema, ["Meal Type"], meal_type)
         method_prop = _set_select_if_allowed(properties, schema, ["Log Method"], log_method)
@@ -594,7 +618,7 @@ async def create_food_entry(
         properties["Sugar"]        = {"number": _safe_number(nutrition.sugar_g)}
         properties["Sodium"]       = {"number": _safe_int(nutrition.sodium_mg)}
         properties["Portion Size"] = {"rich_text": [{"text": {"content": nutrition.portion_size[:2000]}}]}
-        properties["Notes"]        = {"rich_text": [{"text": {"content": nutrition.notes[:2000]}}]}
+        properties["Notes"]        = {"rich_text": [{"text": {"content": entry_notes[:2000]}}]}
         if meal_type:
             properties["Meal Type"] = {"select": {"name": meal_type}}
             optional_props.add("Meal Type")
@@ -649,8 +673,8 @@ async def archive_food_entry(page_id: str) -> None:
 
 
 @_retry
-async def get_week_calorie_bank(calorie_goal: int = 0) -> dict:
-    today = date.today()
+async def get_week_calorie_bank(calorie_goals: dict[str, int] | int = 0) -> dict:
+    today = local_today()
     week_start = today - timedelta(days=today.weekday())
     days_elapsed = today.weekday() + 1
 
@@ -668,8 +692,12 @@ async def get_week_calorie_bank(calorie_goal: int = 0) -> dict:
         float(p["properties"].get("Calories", {}).get("number") or 0)
         for p in pages
     )
-    goal = calorie_goal if calorie_goal > 0 else config.DAILY_CALORIES_GOAL
-    expected = goal * days_elapsed
+    if isinstance(calorie_goals, dict):
+        expected = sum(calorie_goals.get((week_start + timedelta(days=i)).isoformat(), 0)
+                       for i in range(days_elapsed))
+    else:
+        goal = calorie_goals if calorie_goals > 0 else config.DAILY_CALORIES_GOAL
+        expected = goal * days_elapsed
     return {
         "days_elapsed": days_elapsed,
         "total_calories": round(total_cal),
@@ -679,7 +707,7 @@ async def get_week_calorie_bank(calorie_goal: int = 0) -> dict:
 
 
 async def get_last_month_data() -> dict:
-    today = date.today()
+    today = local_today()
     first_this_month = today.replace(day=1)
     last_month_end = first_this_month - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
@@ -993,7 +1021,7 @@ async def get_streak() -> int:
     Entries are walked newest-first so the scan can stop at the first gap —
     a broken streak costs a single page instead of the whole 90-day window.
     """
-    today = date.today()
+    today = local_today()
     start = today - timedelta(days=90)
     query_filter = {
         "and": [
@@ -1104,7 +1132,7 @@ async def add_restaurant(name: str, cuisine: str = "") -> str:
 # ── Weekly Review ──────────────────────────────────────────────────────────────────────────────────
 
 async def get_last_week_data() -> dict:
-    today = date.today()
+    today = local_today()
     last_monday = today - timedelta(days=today.weekday() + 7)
     last_sunday = last_monday + timedelta(days=6)
     start_str, end_str = last_monday.isoformat(), last_sunday.isoformat()
@@ -1202,7 +1230,7 @@ async def get_recent_weights(limit: int = 8) -> list[dict]:
 
 @_retry
 async def get_yesterday_meals() -> list[dict]:
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    yesterday = (local_today() - timedelta(days=1)).isoformat()
     response = await notion.databases.query(
         database_id=config.NOTION_FOOD_DB_ID,
         filter={"property": "Date", "date": {"equals": yesterday}},
@@ -1370,6 +1398,11 @@ async def get_user_goals() -> dict:
             val = props.get(notion_key, {}).get("number")
             if val is not None:
                 goals[goal_key] = int(val)
+        raw_profiles = _page_rich_text(props, ["Profile Goals"])
+        if raw_profiles:
+            parsed = json.loads(raw_profiles)
+            if isinstance(parsed, dict):
+                goals["profiles"] = parsed
         return goals
     except Exception as exc:
         logger.warning("Could not load user goals from Notion: %s", exc)
@@ -1382,6 +1415,10 @@ async def save_user_goals(goals: dict) -> None:
     for notion_key, goal_key in _GOAL_PROPS.items():
         if goal_key in goals:
             properties[notion_key] = {"number": int(goals[goal_key])}
+    profiles = goals.get("profiles")
+    if isinstance(profiles, dict):
+        encoded = json.dumps(profiles, separators=(",", ":"), sort_keys=True)
+        properties["Profile Goals"] = {"rich_text": [{"text": {"content": encoded[:2000]}}]}
     try:
         existing = await _find_daily_log_page(_GOALS_PAGE_NAME)
         if existing:

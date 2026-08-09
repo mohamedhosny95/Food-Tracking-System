@@ -36,9 +36,12 @@ services:
       - key: NOTION_PARENT_PAGE_ID
         sync: false
 
-      # ── Optional: Telegram user whitelist (comma-separated IDs) ──────────
+      # ── Required: single Telegram owner's numeric ID ──────────────────
       - key: ALLOWED_USER_IDS
         sync: false
+
+      - key: ALLOW_UNAUTHENTICATED
+        value: "false"
 
       # ── Macro & hydration goals (defaults shown — override if needed) ─────
       - key: DAILY_CALORIES_GOAL
@@ -59,9 +62,11 @@ services:
       - key: DAILY_WATER_GOAL_ML
         value: "2500"
 
-      # ── Timezone offset from UTC (e.g. 3 for UTC+3) ───────────────────────
-      - key: TIMEZONE_HOURS
-        value: "3"
+      - key: TIMEZONE_NAME
+        value: "Africa/Cairo"
+
+      - key: GEMINI_MODEL
+        value: "gemini-3.6-flash"
 
       # ── Low-calorie warning threshold (fraction of daily goal) ────────────
       - key: LOW_CALORIE_THRESHOLD

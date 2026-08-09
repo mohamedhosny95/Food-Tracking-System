@@ -1,22 +1,22 @@
 import asyncio
-import base64
 import io
 import json
 import logging
+import math
 import re
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import PIL.Image
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 import config
 
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=config.GEMINI_API_KEY)
-_model = genai.GenerativeModel(config.GEMINI_MODEL)
+_client = genai.Client(api_key=config.GEMINI_API_KEY)
 
 # ── Shared JSON schema rules ───────────────────────────────────────────────────
 
@@ -68,7 +68,7 @@ Use this exact schema:
 {_RULES}
 - Confidence: High = specific quantities given, Medium = quantities estimated from typical serving, Low = very vague description."""
 
-RESTAURANT_PROMPT = f"""You are a professional nutritionist with access to nutrition databases for major restaurant chains worldwide. The user will tell you a meal name and optionally a restaurant name. Use published nutrition data if you recognise the restaurant; otherwise estimate based on typical preparation.
+RESTAURANT_PROMPT = f"""You estimate nutrition from the meal description and general model knowledge. You do not have live access to restaurant nutrition databases. Never claim that a value is official or published unless a source was supplied in the request. The user will tell you a meal name and optionally a restaurant name.
 
 The user may write in Arabic or English. Understand Arabic restaurant and dish names natively. If the input is in Arabic, set food_name to the English name followed by the Arabic in parentheses — e.g. "Shawarma (شاورما)".
 
@@ -79,8 +79,8 @@ Use this exact schema (set food_name to include restaurant e.g. 'Big Mac (McDona
 {_SCHEMA}
 
 {_RULES}
-- Confidence: High = known chain with published data, Medium = recognised dish with estimated portion, Low = unknown restaurant or very ambiguous dish.
-- In notes: state whether you used published data or estimated, and flag if the restaurant is NOT in your knowledge base."""
+- Confidence may not be High without a user-supplied label or official source.
+- In notes: clearly say this is an unverified AI estimate and list the portion assumptions."""
 
 VOICE_PROMPT = f"""Listen to this voice message. The user is describing food they are eating or have just prepared. The user may speak in Arabic or English. First transcribe what they said (in their original language), then calculate the nutrition.
 
@@ -144,22 +144,23 @@ def _is_quota_error(exc: Exception) -> bool:
     wait=wait_exponential(multiplier=1, min=2, max=10),
     reraise=True,
 )
-async def _stream(parts: list) -> str:
-    """Call Gemini with streaming and return the full concatenated text."""
-    raw = ""
+async def _stream(
+    parts: list,
+    *,
+    response_mime_type: str = "application/json",
+    max_output_tokens: int = 2048,
+) -> str:
+    """Call Gemini through the maintained Google GenAI SDK."""
     try:
-        async for chunk in await _model.generate_content_async(
-            parts,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=2048,
+        response = await _client.aio.models.generate_content(
+            model=config.GEMINI_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_output_tokens,
                 temperature=0.1,
+                response_mime_type=response_mime_type,
             ),
-            stream=True,
-        ):
-            try:
-                raw += chunk.text
-            except Exception:
-                pass
+        )
     except Exception as e:
         if _is_quota_error(e):
             raise RuntimeError(
@@ -168,17 +169,32 @@ async def _stream(parts: list) -> str:
             ) from e
         logger.warning("Gemini API call failed (will retry): %s", e)
         raise
-    return raw.strip()
+    return (response.text or "").strip()
+
+
+def _image_part(image_bytes: bytes) -> types.Part:
+    if len(image_bytes) > 20 * 1024 * 1024:
+        raise RuntimeError("Image is too large. Please send a photo under 20 MB.")
+    try:
+        with PIL.Image.open(io.BytesIO(image_bytes)) as image:
+            if image.width * image.height > 40_000_000:
+                raise RuntimeError("Image dimensions are too large.")
+            image.verify()
+            mime_type = PIL.Image.MIME.get(image.format, "image/jpeg")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("The uploaded image could not be read.") from exc
+    return types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
 
 # ── Analysis functions ─────────────────────────────────────────────────────────
 
 async def analyze_food_photo(image_bytes: bytes) -> NutritionData:
-    image = PIL.Image.open(io.BytesIO(image_bytes))
-    raw = await _stream([VISION_PROMPT, image])
+    raw = await _stream([VISION_PROMPT, _image_part(image_bytes)])
     logger.debug("Vision response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
-    nutrition.source = "AI (Photo)"
+    nutrition.source = "AI estimate (photo)"
     return nutrition
 
 
@@ -191,7 +207,7 @@ async def analyze_food_text(description: str, cooking_context: str = "") -> Nutr
     raw = await _stream([TEXT_PROMPT + f"\n\nMeal description: {description}{suffix}"])
     logger.debug("Text response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
-    nutrition.source = "AI (Ingredients)"
+    nutrition.source = "AI estimate (ingredients)"
     return nutrition
 
 
@@ -208,18 +224,17 @@ async def analyze_restaurant_meal(description: str, serving_type: str = "") -> N
     raw = await _stream([RESTAURANT_PROMPT + f"\n\nMeal: {description}{suffix}"])
     logger.debug("Restaurant response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
-    nutrition.source = "AI (Restaurant DB)"
+    nutrition.source = "AI estimate (restaurant, unverified)"
     return nutrition
 
 
 async def analyze_voice_message(audio_bytes: bytes) -> NutritionData:
     """Transcribes a voice note and analyzes the food described in it."""
-    audio_b64 = base64.b64encode(audio_bytes).decode()
-    audio_part = {"mime_type": "audio/ogg", "data": audio_b64}
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg")
     raw = await _stream([VOICE_PROMPT, audio_part])
     logger.debug("Voice response (%d chars): %s", len(raw), raw)
     nutrition = _parse_nutrition_response(raw)
-    nutrition.source = "AI (Voice)"
+    nutrition.source = "AI estimate (voice)"
     return nutrition
 
 
@@ -234,20 +249,12 @@ _BARCODE_PROMPT = (
 
 
 async def extract_barcode_number(image_bytes: bytes) -> str | None:
-    image = PIL.Image.open(io.BytesIO(image_bytes))
-    raw = ""
     try:
-        async for chunk in await _model.generate_content_async(
-            [_BARCODE_PROMPT, image],
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=64, temperature=0.0
-            ),
-            stream=True,
-        ):
-            try:
-                raw += chunk.text
-            except Exception:
-                pass
+        raw = await _stream(
+            [_BARCODE_PROMPT, _image_part(image_bytes)],
+            response_mime_type="text/plain",
+            max_output_tokens=64,
+        )
     except Exception as e:
         logger.error("Gemini barcode extraction failed: %s", e)
         return None
@@ -380,6 +387,46 @@ def _coerce_int(value, default: int = 0) -> int:
     return int(round(_coerce_float(value, float(default))))
 
 
+def validate_nutrition(nutrition: NutritionData) -> NutritionData:
+    """Bound unsafe model output and flag energy/macro inconsistencies."""
+    limits = {
+        "calories": 10_000,
+        "protein_g": 1_000,
+        "carbs_g": 2_000,
+        "fat_g": 1_000,
+        "fiber_g": 250,
+        "sugar_g": 1_000,
+        "sodium_mg": 100_000,
+        "estimated_weight_g": 10_000,
+    }
+    warnings: list[str] = []
+    for field_name, maximum in limits.items():
+        value = getattr(nutrition, field_name)
+        if not math.isfinite(value) or value < 0:
+            setattr(nutrition, field_name, 0.0)
+            warnings.append(f"invalid {field_name} was removed")
+        elif value > maximum:
+            setattr(nutrition, field_name, float(maximum))
+            warnings.append(f"implausible {field_name} was capped")
+
+    macro_kcal = nutrition.protein_g * 4 + nutrition.carbs_g * 4 + nutrition.fat_g * 9
+    if nutrition.calories > 0 and macro_kcal > 0:
+        difference = abs(macro_kcal - nutrition.calories)
+        if difference > max(100, nutrition.calories * 0.20):
+            warnings.append(
+                f"energy check differs by {difference:.0f} kcal from the listed macros"
+            )
+
+    nutrition.confidence_pct = max(0, min(int(nutrition.confidence_pct), 100))
+    if warnings:
+        nutrition.confidence = "Low"
+        nutrition.confidence_pct = min(nutrition.confidence_pct or 40, 50)
+        warning_text = "Validation warning: " + "; ".join(warnings) + "."
+        if warning_text not in nutrition.notes:
+            nutrition.notes = f"{nutrition.notes}\n{warning_text}".strip()
+    return nutrition
+
+
 def _parse_nutrition_response(raw_text: str) -> NutritionData:
     data: dict | None = None
 
@@ -427,7 +474,7 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
     if transcription and "Voice" not in notes:
         notes = f'Voice: "{transcription}"\n{notes}'.strip()
 
-    return NutritionData(
+    return validate_nutrition(NutritionData(
         food_name=str(data.get("food_name") or "Unknown Food"),
         portion_size=str(data.get("portion_size") or "Unknown"),
         calories=_coerce_float(data.get("calories")),
@@ -443,4 +490,4 @@ def _parse_nutrition_response(raw_text: str) -> NutritionData:
         recognizable=bool(data.get("recognizable", True)),
         transcription=transcription,
         estimated_weight_g=_coerce_float(data.get("estimated_weight_g")),
-    )
+    ))
