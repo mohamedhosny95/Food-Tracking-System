@@ -1,13 +1,10 @@
 name: Run Bot
 
-# Keeps the deployed Telegram bot refreshed after main updates.
-# Restart trigger: Codex stability fixes 2026-05-11.
+# Manually-triggered only. Automatic push/schedule triggers were removed
+# 2026-08-24 to stop the bot from auto-restarting/redeploying; run this
+# workflow by hand (Actions tab -> Run Bot -> Run workflow) when needed.
 on:
-  push:
-    branches: [main]          # restart immediately on every push to main
-  schedule:
-    - cron: '0 */5 * * *'   # restart every 5 hours (GitHub jobs max out at 6h)
-  workflow_dispatch:          # also allows manual "Run workflow" button
+  workflow_dispatch:
 
 concurrency:
   group: bot-runner
